@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import { env } from '../config/env';
 import type { PublicUser } from '../utils/publicUser';
 import type { TokenPair } from './token.service';
 
@@ -27,12 +28,6 @@ interface HandoffEntry {
 }
 
 const HANDOFF_TTL_MS = 60 * 1000; // must be exchanged within 1 minute
-// A defensive cap, not an expected operating point: purgeExpired() below
-// keeps normal usage far under this even during a heavy burst of logins
-// (each entry only lives ~60s), but bounding store.size means a sustained
-// flood of Google logins within a single TTL window — whatever the cause —
-// can't grow this map without bound in a long-running process.
-const MAX_HANDOFF_ENTRIES = 1000;
 const store = new Map<string, HandoffEntry>();
 
 function purgeExpired(): void {
@@ -45,12 +40,30 @@ function purgeExpired(): void {
 /** Stashes a login result behind a fresh opaque code and returns that code. */
 export function createHandoff(user: PublicUser, tokens: TokenPair): string {
   purgeExpired();
-  if (store.size >= MAX_HANDOFF_ENTRIES) {
+  if (store.size >= env.OAUTH_HANDOFF_MAX_ENTRIES) {
     // Still over the cap after purging expired entries — evict the oldest
-    // one. Map iteration order is insertion order, so the first key from
-    // the iterator is the oldest surviving entry.
+    // one (Map iterates in insertion order, so the first key is the oldest
+    // surviving entry) rather than let this grow without bound.
+    //
+    // This is a real tradeoff, not a free backstop: the entry being evicted
+    // here hasn't expired yet — it belongs to someone who logged in
+    // recently and hasn't finished exchanging their code. Evicting it means
+    // that person's login will fail with "invalid or expired code" even
+    // though nothing was actually wrong with their flow. OAUTH_HANDOFF_MAX_ENTRIES
+    // defaults to 5000 specifically to make this vanishingly unlikely under
+    // realistic traffic — hitting it means 5000 *real, successful* Google
+    // logins landed within the same ~60s TTL window without being
+    // exchanged, which requires actual valid Google accounts completing
+    // actual OAuth consent screens, not something trivially scriptable.
+    // Logged rather than silently swallowed, since it's exactly the kind of
+    // thing that should page someone rather than just quietly cost one
+    // unlucky user a failed login.
     const oldestKey = store.keys().next().value;
     if (oldestKey !== undefined) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `oauthHandoff: evicting an unexpired handoff entry — store hit its ${env.OAUTH_HANDOFF_MAX_ENTRIES}-entry cap. A legitimate pending login may fail.`,
+      );
       store.delete(oldestKey);
     }
   }

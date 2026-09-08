@@ -11,6 +11,24 @@ import { prisma } from '../lib/prisma';
 import { toPublicUser } from '../utils/publicUser';
 
 const OAUTH_STATE_COOKIE = 'oauth_state';
+// Shared between googleRedirect (which sets this cookie) and googleCallback
+// (which clears it) so the two can never drift out of sync. That matters
+// because a cookie is not cleared just by calling res.clearCookie(name) with
+// no options — Express (and the underlying Set-Cookie mechanics) needs the
+// clearing call's attributes to match the ones the cookie was actually set
+// with, or the browser may simply keep the original cookie around instead of
+// overwriting it. An earlier version set this cookie with
+// { httpOnly, secure, sameSite, signed, maxAge } but cleared it with no
+// options at all — functionally harmless for the *current* request (the
+// state value used for validation is read into a variable before clearing
+// either way), but it meant the cookie could survive in the browser past
+// this callback, available to be reused in a way it was never meant to be.
+const OAUTH_STATE_COOKIE_OPTIONS = {
+  httpOnly: true,
+  secure: env.NODE_ENV === 'production',
+  sameSite: 'lax' as const,
+  signed: true,
+};
 
 export async function signup(req: Request, res: Response, next: NextFunction) {
   try {
@@ -59,6 +77,19 @@ export async function me(req: AuthenticatedRequest, res: Response, next: NextFun
     if (!user) {
       throw new AppError(404, 'User not found');
     }
+    if (!user.isActive) {
+      // The access token itself doesn't know a user was disabled after it
+      // was issued — it's a self-contained, stateless JWT (see jwt.ts) that
+      // stays "valid" purely by having the right signature and not having
+      // expired yet. This is the check that catches that gap: `me` already
+      // does a database read on every call, so it's a natural, low-cost
+      // place to also confirm the account is still meant to work. A 403
+      // (not the generic-message 401 pattern login uses) is fine here
+      // specifically because there's no enumeration concern to protect
+      // against — the caller has already proven their identity by holding
+      // a valid token for this exact account.
+      throw new AppError(403, 'This account has been disabled');
+    }
     res.status(200).json({ user: toPublicUser(user) });
   } catch (err) {
     next(err);
@@ -70,10 +101,7 @@ export function googleRedirect(_req: Request, res: Response) {
   const state = crypto.randomBytes(24).toString('hex');
 
   res.cookie(OAUTH_STATE_COOKIE, state, {
-    httpOnly: true,
-    secure: env.NODE_ENV === 'production',
-    sameSite: 'lax',
-    signed: true,
+    ...OAUTH_STATE_COOKIE_OPTIONS,
     maxAge: 5 * 60 * 1000, // 5 minutes — just long enough to complete the consent screen
   });
 
@@ -85,7 +113,12 @@ export async function googleCallback(req: Request, res: Response, next: NextFunc
   try {
     const { code, state } = req.query;
     const cookieState = req.signedCookies?.[OAUTH_STATE_COOKIE];
-    res.clearCookie(OAUTH_STATE_COOKIE);
+    // Cleared with the SAME options it was set with (see the constant's own
+    // comment above) — the state value needed for validation below was
+    // already captured into `cookieState` above, so clearing here doesn't
+    // affect this request's own validation either way; it's purely about
+    // making sure the cookie doesn't linger in the browser afterward.
+    res.clearCookie(OAUTH_STATE_COOKIE, OAUTH_STATE_COOKIE_OPTIONS);
 
     if (typeof code !== 'string') {
       throw new AppError(400, 'Missing authorization code');

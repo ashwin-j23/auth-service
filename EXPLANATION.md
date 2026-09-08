@@ -70,6 +70,11 @@ model User {
   name            String?
   googleId        String?   @unique
   isEmailVerified Boolean   @default(false)
+
+  failedLoginAttempts Int      @default(0)
+  lockedUntil         DateTime?
+  isActive        Boolean   @default(true)
+
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
   refreshTokens   RefreshToken[]
@@ -98,6 +103,22 @@ Line by line:
   claim to be the same Google identity.
 - `isEmailVerified Boolean @default(false)` — true once we have external
   confirmation (currently: Google says so) that this address is real.
+- `failedLoginAttempts Int @default(0)` / `lockedUntil DateTime?` — the
+  account-level lockout `auth.service.ts`'s `login()` enforces (§10). Both
+  reset to `0`/`null` on every successful login; `failedLoginAttempts`
+  increments on every failed one, and `lockedUntil` gets set once it crosses
+  `LOCKOUT_MAX_ATTEMPTS`. This is deliberately a *separate* mechanism from
+  the per-IP rate limiting in `rateLimit.middleware.ts` — that one can't
+  stop an attacker who spreads password guesses for one specific account
+  across many different IPs, which is exactly the gap tracking failures on
+  the account itself closes.
+- `isActive Boolean @default(true)` — a *permanent*, admin-driven kind of
+  "off," distinct from the self-clearing lockout above. Checked in `login()`,
+  `rotateRefreshToken()`, and `GET /me` (§10, §9, §12) — the three places a
+  disabled account could otherwise keep working: log in and get fresh
+  tokens, use an already-issued refresh token to keep minting new access
+  tokens indefinitely, or use an already-issued access token to call the one
+  endpoint that reads it back.
 - `updatedAt DateTime @updatedAt` — Prisma auto-updates this on every write,
   no application code needed.
 - `refreshTokens RefreshToken[]` — the reverse side of the relation defined
@@ -157,6 +178,7 @@ const envSchema = z.object({
       /^\d+$|^\d+(\.\d+)?\s?(ms|s|m|h|d|w|y)$/,
       'JWT_ACCESS_TTL must be a number of seconds, or a value like "15m", "1h", "7d"',
     )
+    .refine((v) => parseFloat(v) > 0, 'JWT_ACCESS_TTL must be greater than zero')
     .default('15m'),
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(7),
   COOKIE_SECRET: z.string().min(16, 'COOKIE_SECRET must be at least 16 characters'),
@@ -176,6 +198,9 @@ const envSchema = z.object({
   RATE_LIMIT_STANDARD_MAX: z.coerce.number().int().positive().default(100),
   JWT_ISSUER: z.string().min(1).default('auth-service'),
   JWT_AUDIENCE: z.string().min(1).default('auth-service'),
+  OAUTH_HANDOFF_MAX_ENTRIES: z.coerce.number().int().positive().default(5000),
+  LOCKOUT_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
+  LOCKOUT_DURATION_MS: z.coerce.number().int().positive().default(15 * 60 * 1000),
 });
 
 export const env = envSchema.parse(process.env);
@@ -204,6 +229,17 @@ export const env = envSchema.parse(process.env);
   short unit like `15m`/`1h`/`7d`) makes the two actually agree — an invalid
   value now fails at the same `envSchema.parse()` call as every other
   misconfiguration.
+- The `.refine((v) => parseFloat(v) > 0, ...)` right after that regex closes
+  a gap the regex itself *can't* — `\d+` matches a literal `0` just as
+  validly as `15`, so `"0"`, `"0s"`, `"0.0h"` all pass the format check
+  without complaint. That's a format that happens to describe zero duration,
+  not an invalid format, so no regex rewrite fixes it — it needs an actual
+  value check. Left alone, `JWT_ACCESS_TTL=0` would boot cleanly and then
+  silently issue every access token already expired the instant it's
+  signed, which surfaces later as "every single request is unauthorized" —
+  a nasty thing to debug when the real cause is one wrong config value three
+  layers away. `parseFloat("0s")` is `0`, `parseFloat("15m")` is `15` — the
+  refine reads past the unit and checks the number itself.
 - `CORS_ALLOWED_ORIGINS` is `.optional()`, and `ALLOW_ANY_CORS_ORIGIN` is the
   *only* other input `app.ts`'s CORS logic (§18) looks at — deliberately not
   `NODE_ENV`. An earlier version of that logic branched on
@@ -227,6 +263,11 @@ export const env = envSchema.parse(process.env);
   actually controls.
 - `JWT_ISSUER`/`JWT_AUDIENCE` default to `'auth-service'` — see `jwt.ts` (§7)
   for what they're checked against.
+- `OAUTH_HANDOFF_MAX_ENTRIES` — see `oauthHandoff.service.ts` (§11a).
+  `LOCKOUT_MAX_ATTEMPTS`/`LOCKOUT_DURATION_MS` — see `auth.service.ts`'s
+  `login()` (§10). Both configurable for the same reason the rate-limit
+  numbers are: so the actual thresholds can be tuned to real traffic/usage
+  without a code change.
 - `envSchema.parse(process.env)` — **throws immediately** if anything is
   missing or malformed. This means a missing `GOOGLE_CLIENT_SECRET` crashes
   the app the instant it starts (with a clear zod error naming the field),
@@ -333,13 +374,15 @@ export class AppError extends Error {
 export interface AccessTokenPayload {
   sub: string; // user id
   email: string;
+  jti: string; // unique ID for this specific token — see signAccessToken
 }
 
-export function signAccessToken(payload: AccessTokenPayload): string {
+export function signAccessToken(payload: Omit<AccessTokenPayload, 'jti'>): string {
   return jwt.sign(payload, env.JWT_ACCESS_SECRET, {
     expiresIn: env.JWT_ACCESS_TTL,
     issuer: env.JWT_ISSUER,
     audience: env.JWT_AUDIENCE,
+    jwtid: crypto.randomUUID(),
   });
 }
 ```
@@ -356,6 +399,22 @@ export function signAccessToken(payload: AccessTokenPayload): string {
 - `issuer`/`audience` add `iss`/`aud` claims — a name for "who issued this"
   and "who it's for." On their own, at sign time, these don't add
   protection — they only matter once `verify` actually checks them, next.
+- `jwtid: crypto.randomUUID()` adds a `jti` claim — a random, unique ID for
+  *this specific token*, freshly generated on every single call (so two
+  tokens for the same user always have different `jti`s, even issued in the
+  same millisecond — `signAccessToken`'s parameter type is
+  `Omit<AccessTokenPayload, 'jti'>` specifically so a caller can't pass one
+  in and accidentally reuse it). Nothing in this codebase actually *checks*
+  it yet — there's no revocation list, and a compromised or otherwise-bad
+  access token stays usable until it naturally expires (15 minutes by
+  default). What `jti` buys, on its own, is the minimum groundwork such a
+  list would need later: you can't blocklist an individual token without
+  some way to name it. Building the list itself is deliberately left out
+  for now — it needs a shared store (Redis, most likely) checked on *every*
+  authenticated request, trading away a real chunk of the current design's
+  fully-stateless simplicity, which is a bigger tradeoff than adding a UUID
+  to a JWT and worth deferring until immediate token revocation is an actual
+  requirement rather than a hypothetical one.
 
 ```ts
 export function verifyAccessToken(token: string): AccessTokenPayload {
@@ -363,10 +422,10 @@ export function verifyAccessToken(token: string): AccessTokenPayload {
     issuer: env.JWT_ISSUER,
     audience: env.JWT_AUDIENCE,
   });
-  if (typeof decoded === 'string' || !decoded.sub || !decoded.email) {
+  if (typeof decoded === 'string' || !decoded.sub || !decoded.email || !decoded.jti) {
     throw new jwt.JsonWebTokenError('Malformed access token payload');
   }
-  return { sub: decoded.sub, email: decoded.email as string };
+  return { sub: decoded.sub, email: decoded.email as string, jti: decoded.jti };
 }
 ```
 - `jwt.verify` recomputes the HMAC signature using the same secret and
@@ -539,10 +598,26 @@ detection" (used by e.g. Auth0, and described in the OAuth security BCP).
   if (stored.expiresAt < new Date()) {
     throw new AppError(401, 'Refresh token has expired');
   }
+  if (!stored.user.isActive) {
+    throw new AppError(401, 'This account is no longer active');
+  }
 ```
 Straightforward expiry check, separate from the revoked check above so the
 error message is accurate (a stale-but-never-used token isn't "reused," it's
-just old).
+just old). The `isActive` check right after it closes a specific gap:
+without it, an already-issued refresh token would keep working — keep
+minting fresh access tokens, indefinitely, past its own natural expiry via
+rotation — for an account that's since been disabled, even though
+`auth.service.ts`'s `login()` (§10) already refuses that same account at the
+front door. `stored.user` is available here for free (the earlier
+`findUnique` already `include`s it, to sign the access token below), so this
+costs nothing extra to check. Unlike `login()`'s deliberately generic
+"Invalid email or password" (used everywhere in that function specifically
+to avoid confirming account existence to a guessing attacker), this message
+can afford to be specific: reaching this line already requires possessing
+one particular, high-entropy refresh token, not a guessable credential, so
+there's no meaningful enumeration risk in saying exactly why it stopped
+working.
 
 ```ts
   const newRawRefreshToken = generateRawRefreshToken();
@@ -645,7 +720,7 @@ never be treated as a failure from the client's perspective.
 ```ts
 // src/utils/email.ts — shared by this file AND google.service.ts
 export function normalizeEmail(email: string): string {
-  return email.trim().toLowerCase();
+  return email.trim().normalize('NFC').toLowerCase();
 }
 ```
 `Jane@Example.com`, ` jane@example.com`, and `jane@example.com` should all be
@@ -653,11 +728,28 @@ the *same* account. Normalizing before every lookup/insert means the `@unique`
 constraint on `email` in the schema actually behaves the way a user expects.
 This function lives in its own `src/utils/email.ts` (not duplicated locally)
 specifically because `google.service.ts` needs the exact same normalization —
-if the two files each implemented "trim + lowercase" independently, a future
-tweak to one (say, adding Unicode normalization for lookalike characters)
-applied to only one of them would make the two files disagree about what
-"the same email" means, and the Google-account-linking logic in
-`google.service.ts` (§11) depends entirely on that agreement to work.
+if the two files each implemented this independently, a tweak to one applied
+to only one of them would make the two files disagree about what "the same
+email" means, and the Google-account-linking logic in `google.service.ts`
+(§11) depends entirely on that agreement to work.
+
+`.normalize('NFC')` is worth its own explanation, because the bug it closes
+is genuinely non-obvious. Unicode allows the *same visual character* to be
+encoded more than one way: "é" can be a single precomposed codepoint
+(U+00E9, the "NFC" — Normalization Form C — encoding) or built from "e" plus
+a separate combining acute-accent codepoint (U+0065 U+0301, "NFD"). Both
+render identically in every font, mean the same thing to a human, and are
+completely different strings byte-for-byte to a computer — so without this,
+`josé@example.com` typed on a system that produces NFC and the *same address*
+typed on one that produces NFD (both happen in the wild — it depends on
+input method, OS, and the software in between) would be treated as two
+different emails: two different rows able to exist past the `@unique`
+constraint despite a human reading them as the exact same address, and,
+concretely for this app, a real way `google.service.ts`'s email-based
+account-linking lookup could miss a genuine match. `.normalize('NFC')`
+collapses both encodings to one canonical form before anything else touches
+the string — applied before `.toLowerCase()`, so case-folding always runs on
+already-normalized input, not the other way around.
 
 ```ts
 export async function signup(input: SignupInput): Promise<AuthResult> {
@@ -731,25 +823,108 @@ export async function login(input: LoginInput): Promise<AuthResult> {
   if (!user || !user.passwordHash) {
     throw invalidCredentials();
   }
+  if (!user.isActive) {
+    throw invalidCredentials();
+  }
+
+  const isLocked = user.lockedUntil !== null && user.lockedUntil > new Date();
+  if (isLocked) {
+    throw invalidCredentials();
+  }
 
   const passwordMatches = await comparePassword(input.password, user.passwordHash);
+
   if (!passwordMatches) {
+    const attemptsBeforeThisOne = user.lockedUntil !== null ? 0 : user.failedLoginAttempts;
+    const attempts = attemptsBeforeThisOne + 1;
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        failedLoginAttempts: attempts,
+        lockedUntil:
+          attempts >= env.LOCKOUT_MAX_ATTEMPTS
+            ? new Date(Date.now() + env.LOCKOUT_DURATION_MS)
+            : null,
+      },
+    });
     throw invalidCredentials();
+  }
+
+  if (user.failedLoginAttempts > 0 || user.lockedUntil !== null) {
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { failedLoginAttempts: 0, lockedUntil: null },
+    });
   }
 
   const tokens = await issueTokenPair(user);
   return { user: toPublicUser(user), tokens };
 }
 ```
-The important design decision here: **three different failure conditions —
-no such account, account exists but has no password (Google-only), account
-exists but the password is wrong — all throw the exact same error message**
-(`invalidCredentials()`). This is deliberate: if "wrong password" and "no
-such account" returned different messages, an attacker could use the login
-endpoint to enumerate which emails have accounts (try a list of addresses,
-see which ones say "wrong password" vs. "no account"). Login is
-attacker-facing in a way signup isn't (credential-stuffing bots hit login
-endpoints, not signup endpoints), so it gets the more paranoid treatment.
+The important design decision from before still holds and is worth
+restating precisely now that there's more happening in this function:
+**every failure condition — no such account, no password set (Google-only),
+disabled, currently locked out, or simply the wrong password — throws the
+exact same `invalidCredentials()` error, with the same message and status.**
+This is deliberate: if any of those returned a *different* message, an
+attacker could use the login endpoint to enumerate real accounts (try a list
+of addresses, see which ones say something other than "wrong password") or
+learn something about a specific account's state (locked? disabled?) just
+by watching how the error differs. Login is attacker-facing in a way signup
+isn't (credential-stuffing bots hit login endpoints, not signup endpoints),
+so it gets the more paranoid treatment throughout — every new check added
+below follows that same rule, not just the original three.
+
+**The lockout mechanism, read top to bottom:**
+
+- `if (!user.isActive) throw invalidCredentials();` — checked before
+  anything password-related. A disabled account can never succeed regardless
+  of what's typed, so there's nothing to gain by comparing the password or
+  touching lockout bookkeeping for it — same generic message as always, no
+  wasted work.
+- `isLocked` — `lockedUntil !== null && lockedUntil > new Date()`. Note this
+  is **not** just `lockedUntil !== null`: a `lockedUntil` that's set but in
+  the *past* means a previous lockout that has since expired, which is a
+  meaningfully different state (handled a few lines down), not a current
+  lock. Rejected here, before `comparePassword` ever runs — on top of not
+  leaking lockout state via a different message, this also means a
+  currently-locked account doesn't pay bcrypt's ~50-100ms-per-guess cost, a
+  small extra brake on an attacker hammering it during the lockout window.
+- On a wrong password: `attemptsBeforeThisOne` is where the one genuinely
+  subtle piece of logic lives. Naively, this would just be
+  `user.failedLoginAttempts` — but that undercounts one real case: a lockout
+  that has already *expired* (checked above and found not-currently-locked)
+  still has its old `failedLoginAttempts` sitting at the limit from before.
+  Using that stale count directly would mean a user re-locks on their very
+  first mistake after cooldown, forever — effectively a permanent lock with
+  extra steps. `user.lockedUntil !== null` (true for an expired-but-still-set
+  lock, same condition `isActive`'s check doesn't care about but this one
+  does) is the signal to start over at `0` instead, giving a fresh, full
+  attempt budget once the cooldown has genuinely passed — exactly like a
+  brand new set of attempts, not a continuation of the old one.
+- `attempts >= env.LOCKOUT_MAX_ATTEMPTS ? new Date(Date.now() + env.LOCKOUT_DURATION_MS) : null`
+  — crosses the threshold → lock for `LOCKOUT_DURATION_MS` from *now*, not
+  from whenever the first failed attempt happened; hasn't crossed it yet →
+  explicitly `null` (not left alone), which matters for the "expired lock"
+  case above: it fully clears the old lock timestamp the moment a fresh
+  attempt sequence starts, rather than leaving a past-but-nonzero
+  `lockedUntil` around to confuse the next read of this same logic.
+- On success: `failedLoginAttempts` and `lockedUntil` are both reset to
+  `0`/`null` — but *only if there's actually something to reset*
+  (`user.failedLoginAttempts > 0 || user.lockedUntil !== null`), skipping a
+  needless database write for the overwhelmingly common case of a clean
+  login history. Note this reset runs even for an *expired* lock, not just
+  an active one — a successful login is always a fully clean slate,
+  regardless of what state the account's lockout bookkeeping happened to be
+  in beforehand.
+- **Why account-level lockout at all, alongside the per-IP rate limiting in
+  `rateLimit.middleware.ts`?** They defend against different attackers. The
+  per-IP limiter caps how many requests *one IP* can make against *any*
+  account — it does nothing to stop an attacker who has, or can rotate
+  through, many different IPs (a botnet, a VPN pool, plain CGNAT) all aimed
+  at *one specific* account's password. Tracking failures on the account
+  itself, independent of where the requests came from, closes exactly that
+  gap; neither mechanism replaces the other.
 
 ---
 
@@ -861,10 +1036,21 @@ export async function findOrCreateGoogleUser(profile: GoogleProfile) {
     if (!profile.emailVerified) {
       throw new AppError(400, 'Google account email is not verified');
     }
-    return prisma.user.update({
-      where: { id: existing.id },
-      data: { googleId: profile.googleId, isEmailVerified: true },
-    });
+    try {
+      return await prisma.user.update({
+        where: { id: existing.id },
+        data: { googleId: profile.googleId, isEmailVerified: true },
+      });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        const winner = await prisma.user.findUnique({ where: { googleId: profile.googleId } });
+        if (winner && winner.email === existing.email) {
+          return winner;
+        }
+        throw new AppError(409, 'This Google account is already linked to a different user');
+      }
+      throw err;
+    }
   }
 
   return prisma.user.create({
@@ -892,7 +1078,29 @@ sequential ones:
    create an account with an *unverified* alternate email in some flows)
    could "log in with Google" as that email and get silently linked to — and
    therefore able to log into — the victim's existing password account.
-   Requiring Google's own verification closes that off.
+   Requiring Google's own verification closes that off. Linking is wrapped
+   in a `try`/`catch` for a reason that's easy to miss on a first read,
+   because most of the time this `update` can't possibly conflict with
+   anything — it's setting `googleId` on a row by its own `id`, not
+   creating anything new. The conflict comes from `googleId`'s own
+   `@unique` constraint (schema, §2) racing against *itself*: if two
+   requests both read `existing` with `googleId: null` before either writes
+   (the same double-click/two-tabs shape as the `create()` race in case 3,
+   below), both proceed to `update`, and only the first one to actually
+   commit succeeds — the second hits `P2002` on the very constraint that's
+   supposed to guarantee one Google account maps to one user. Without the
+   catch, that second request would throw a raw, unhandled database error
+   into `errorHandler`'s generic `500` branch, on what — from that specific
+   Google account's perspective — was still a login that should have
+   worked. The `catch` re-fetches by `googleId` and checks whose row it
+   actually landed on: if it's the **same** account (`winner.email ===
+   existing.email`) — the benign race, the other request just won it first
+   — return that row, no real failure occurred. If it's a **different**
+   account entirely, that's not a race at all; it means this exact
+   `googleId` was already, genuinely, linked to someone else, and silently
+   handing back the wrong user here would be a real bug — that path throws
+   a distinct `409` instead of papering over a real conflict as if it were
+   a harmless retry.
 3. **No match at all** (`existing` is `null`) — brand new user,
    `passwordHash: null` (they can never log in with a password — only
    Google — unless a "set a password" feature is added later). The `create()`
@@ -993,8 +1201,6 @@ only ever calls `createHandoff`/`consumeHandoff`, never touches `store`
 directly.
 
 ```ts
-const MAX_HANDOFF_ENTRIES = 1000;
-
 function purgeExpired(): void {
   const now = Date.now();
   for (const [code, entry] of store) {
@@ -1004,9 +1210,12 @@ function purgeExpired(): void {
 
 export function createHandoff(user: PublicUser, tokens: TokenPair): string {
   purgeExpired();
-  if (store.size >= MAX_HANDOFF_ENTRIES) {
+  if (store.size >= env.OAUTH_HANDOFF_MAX_ENTRIES) {
     const oldestKey = store.keys().next().value;
     if (oldestKey !== undefined) {
+      console.warn(
+        `oauthHandoff: evicting an unexpired handoff entry — store hit its ${env.OAUTH_HANDOFF_MAX_ENTRIES}-entry cap. A legitimate pending login may fail.`,
+      );
       store.delete(oldestKey);
     }
   }
@@ -1019,17 +1228,32 @@ export function createHandoff(user: PublicUser, tokens: TokenPair): string {
 simple, and sufficient for the *expected* case: since a real OAuth login is
 the only thing that ever calls this, the store can only ever accumulate
 entries roughly as fast as people log in, and each login opportunistically
-sweeps out anything stale. `MAX_HANDOFF_ENTRIES` is a second, independent
-safeguard on top of that, not a replacement for it — a defensive backstop
-for a case `purgeExpired()` alone doesn't cover: a *sustained burst* of
-logins, all landing within the same ~60-second TTL window, faster than they
-individually expire. Nothing about that scenario is a bug in the purge logic
-— it's just what "bounded by TTL, not by count" means, and in a long-running
-process, an unbounded burst is still a way to grow this map without limit.
-`store.keys().next().value` reads the *first* key `Map`'s iterator would
-yield — because `Map` iterates in insertion order, that's reliably the
-oldest surviving entry, so hitting the cap evicts the one entry closest to
-expiring anyway, not an arbitrary one.
+sweeps out anything stale. `env.OAUTH_HANDOFF_MAX_ENTRIES` (default 5000) is
+a second, independent safeguard on top of that, not a replacement for it —
+a defensive backstop for a case `purgeExpired()` alone doesn't cover: a
+*sustained burst* of logins, all landing within the same ~60-second TTL
+window, faster than they individually expire. Nothing about that scenario
+is a bug in the purge logic — it's just what "bounded by TTL, not by count"
+means, and in a long-running process, an unbounded burst is still a way to
+grow this map without limit.
+
+Evicting is a genuine tradeoff worth being honest about, not a free
+backstop: `store.keys().next().value` (the oldest surviving entry, since
+`Map` iterates in insertion order) belongs to someone whose login already
+*succeeded* and just hasn't finished the final exchange step yet — evicting
+it means that specific person's login now fails with "invalid or expired
+code," for a reason that has nothing to do with anything they did wrong.
+That's exactly why the default is 5000, not something tighter: reaching it
+means 5000 *genuine, successful* Google logins landed within the same ~60s
+window without being exchanged, which requires actual valid Google accounts
+completing actual consent screens — not something trivially scriptable at
+volume — making it vanishingly unlikely under realistic traffic while still
+capping worst-case memory growth. `console.warn(...)` fires exactly when
+eviction actually happens (not on every `createHandoff` call, and not
+during ordinary TTL-based purging) — deliberately, so this is the kind of
+thing that shows up in logs/monitoring rather than silently costing one
+user a confusing failed login with no trace of why.
+
 `crypto.randomBytes(24)` — the same cryptographically-secure random source
 used for refresh tokens (`token.service.ts`, §9) — generates the code
 itself; guessing a valid one is infeasible for the same reason guessing a
@@ -1087,6 +1311,9 @@ export async function me(req: AuthenticatedRequest, res: Response, next: NextFun
     if (!user) {
       throw new AppError(404, 'User not found');
     }
+    if (!user.isActive) {
+      throw new AppError(403, 'This account has been disabled');
+    }
     res.status(200).json({ user: toPublicUser(user) });
   } catch (err) {
     next(err);
@@ -1094,28 +1321,48 @@ export async function me(req: AuthenticatedRequest, res: Response, next: NextFun
 }
 ```
 This route is only reachable after `requireAuth` middleware has already run
-(see the route definitions in §15), so `req.user` is always set in practice
+(see the route definitions in §17), so `req.user` is always set in practice
 — the `if (!req.user)` check is a defensive fallback for the type checker
 and against future misconfiguration, not a real code path today. Notice it
 re-fetches the user from the database rather than just trusting the JWT
 payload: the JWT only proves "this was the user at token-issue time" — if
-the account is deleted, or a security feature blocks it after the token was
-issued, a fresh DB read reflects that; the JWT payload itself could be
-stale.
+the account is deleted or disabled after the token was issued, a fresh DB
+read reflects that; the JWT payload itself is a signed snapshot that can go
+stale the moment anything about the account changes.
+
+The `isActive` check is exactly that kind of gap being closed: a JWT is
+self-contained and stateless by design (§7) — it stays cryptographically
+"valid" purely by having the right signature and not yet being past its
+`exp`, with no way for the token itself to know an admin disabled the
+account five minutes after it was issued. `me` already does a database read
+on every call regardless, so checking `isActive` here costs nothing extra —
+a natural, low-cost place to close that gap, and (together with the same
+check now also in `login()` and `rotateRefreshToken()`, §10/§9) means a
+disabled account can't keep functioning through any of the three paths that
+would otherwise let it. The status is `403` here, not the generic-`401`
+pattern `login()` uses for its own checks — deliberately different, and
+fine specifically because there's no enumeration concern to protect against
+on this route: the caller has already proven their identity by presenting a
+valid, signed token for this exact account, so being specific about *why*
+access was refused doesn't hand an attacker anything they didn't already
+have.
 
 Now the OAuth handlers — this is the part worth reading most carefully:
 
 ```ts
 const OAUTH_STATE_COOKIE = 'oauth_state';
+const OAUTH_STATE_COOKIE_OPTIONS = {
+  httpOnly: true,
+  secure: env.NODE_ENV === 'production',
+  sameSite: 'lax' as const,
+  signed: true,
+};
 
-export function googleRedirect(req: Request, res: Response) {
+export function googleRedirect(_req: Request, res: Response) {
   const state = crypto.randomBytes(24).toString('hex');
 
   res.cookie(OAUTH_STATE_COOKIE, state, {
-    httpOnly: true,
-    secure: env.NODE_ENV === 'production',
-    sameSite: 'lax',
-    signed: true,
+    ...OAUTH_STATE_COOKIE_OPTIONS,
     maxAge: 5 * 60 * 1000,
   });
 
@@ -1134,12 +1381,30 @@ This is `GET /api/auth/google` — the very first step. It:
 3. Redirects the browser to Google, **also** embedding that same `state` in
    the URL Google will eventually redirect back to.
 
+`OAUTH_STATE_COOKIE_OPTIONS` is pulled out into its own constant, shared
+with `googleCallback` below, and it's worth explaining why that's not just
+tidiness. An earlier version of this file set this cookie with exactly these
+options here, but *cleared* it in `googleCallback` with
+`res.clearCookie(OAUTH_STATE_COOKIE)` — no options at all. That's a real
+gap, not a style nit: a cookie is only reliably overwritten/cleared by a
+`Set-Cookie` response whose attributes (`Path`, `Secure`, `SameSite`, in
+particular) match how it was originally set — mismatched attributes can mean
+the browser treats the clearing response as describing a *different*
+cookie and leaves the original sitting in place. The state value used for
+*validating* the current request was already read into a local variable
+before any clearing happens either way, so this mismatch was never a bug in
+that request's own logic — but it meant the cookie could survive in the
+browser past the callback that was supposed to invalidate it, available to
+be reused in a way it was never meant to be. Sharing one constant between
+the `set` and `clear` calls makes it structurally impossible for the two to
+drift apart again.
+
 ```ts
 export async function googleCallback(req: Request, res: Response, next: NextFunction) {
   try {
     const { code, state } = req.query;
     const cookieState = req.signedCookies?.[OAUTH_STATE_COOKIE];
-    res.clearCookie(OAUTH_STATE_COOKIE);
+    res.clearCookie(OAUTH_STATE_COOKIE, OAUTH_STATE_COOKIE_OPTIONS);
 
     if (typeof code !== 'string') {
       throw new AppError(400, 'Missing authorization code');
@@ -1480,8 +1745,8 @@ authRouter.post('/refresh', standardAuthRateLimiter, validate(refreshSchema), au
 authRouter.post('/logout', standardAuthRateLimiter, validate(refreshSchema), authController.logout);
 authRouter.get('/me', requireAuth, authController.me);
 
-authRouter.get('/google', authController.googleRedirect);
-authRouter.get('/google/callback', authController.googleCallback);
+authRouter.get('/google', standardAuthRateLimiter, authController.googleRedirect);
+authRouter.get('/google/callback', standardAuthRateLimiter, authController.googleCallback);
 authRouter.post(
   '/google/exchange',
   standardAuthRateLimiter,
@@ -1497,18 +1762,24 @@ controller function never executes at all.
 
 Which route gets `strictAuthRateLimiter` vs. `standardAuthRateLimiter`
 matches the split explained in §16: `signup`/`login` get the strict budget,
-`refresh`/`logout`/`google/exchange` get the standard one — two genuinely
-separate counters, not the same limiter instance reused five times. `/logout`
-specifically carries a limiter at all (rather than none) for a reason worth
+everything else that carries a limiter shares the standard one — genuinely
+separate counters, not the same limiter instance reused across every route.
+`/logout` carries a limiter at all (rather than none) for a reason worth
 restating here: it's a mutation that touches the database
 (`prisma.refreshToken.updateMany`) on every call, so leaving it completely
 unbounded would still be a real (if narrow) abuse surface — it just doesn't
-need to share login's stricter budget to be reasonably protected. The two `GET` routes don't carry a limiter: `/google` just redirects to
-Google, and `/google/callback` is driven entirely by Google's own redirect
-(not something an attacker can call at will without first getting Google to
-issue them a valid authorization code) — `/google/exchange`, the route an
-attacker actually *could* hammer directly with guessed handoff codes, is the
-one that carries `standardAuthRateLimiter`.
+need to share login's stricter budget to be reasonably protected.
+
+Both Google `GET` routes now carry `standardAuthRateLimiter` too — an
+earlier version left them unlimited entirely. `/google` looks cheap (it
+just sets a cookie and redirects), but "cheap enough to not bother limiting"
+and "actually unlimited" are different claims, and only the first one was
+ever true; `/google/callback` does real, non-trivial work per call — a
+network round trip to Google to exchange the authorization code, an ID-token
+signature verification, a database read (and sometimes a write) — none of
+which should be reachable at unlimited volume just because the route
+happens to be a `GET` driven by a redirect rather than a `POST` a client
+calls directly.
 
 ---
 
@@ -1563,6 +1834,11 @@ export function createApp() {
   }
 
   app.use(helmet());
+  app.use((_req, res, next) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+    next();
+  });
   app.use(cors({ origin: corsOrigin() }));
   app.use(express.json({ limit: env.JSON_BODY_LIMIT }));
   app.use(cookieParser(env.COOKIE_SECRET));
@@ -1597,6 +1873,26 @@ Order matters throughout:
 - `helmet()` — sets a batch of security-related HTTP response headers
   (`X-Content-Type-Options`, a conservative default CSP, etc.) — applied
   early so it covers every response, including error responses.
+- The small inline middleware right after it sets two more headers `helmet()`
+  doesn't (and structurally can't) set on its own, because `helmet` is
+  generic — it has no way to know this specific API's responses carry
+  access/refresh tokens and user data:
+  - `Cache-Control: no-store` — tells browsers *and* any intermediate
+    cache/proxy sitting between the client and this server "never store
+    this response, full stop." Without it, a shared/corporate proxy, or
+    just the browser's own disk cache, could retain a response that
+    contains a freshly-issued access or refresh token.
+  - `Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=()`
+    — this is a JSON API with no UI of its own; it has no legitimate reason
+    to ever invoke a browser's camera, microphone, geolocation, or
+    payment-handling APIs. Explicitly disabling them is defense-in-depth:
+    a no-op for any well-behaved client, but it closes those APIs off for
+    good in case a response from this server ever ends up rendered
+    somewhere that could otherwise invoke them (a misconfigured client, a
+    future bug, browser dev tools rendering a response directly).
+  Applied to *every* response (including `/health`) rather than scoped to
+  just `/api/auth/*`, since there's no response from this server that should
+  ever be cached or should ever need those browser features.
 - `cors({ origin: corsOrigin() })` — see above.
 - `express.json({ limit: env.JSON_BODY_LIMIT })` — parses `application/json`
   request bodies into `req.body`; without this middleware at all,
@@ -1769,16 +2065,21 @@ password twice gives different output (proves salting is happening);
 `comparePassword` returns `true`/`false` correctly for right/wrong input.
 
 ### `tests/unit/jwt.test.ts`
-Confirms: sign→verify round-trips to the exact original payload; a token
-signed with a *different* secret is rejected (proves signature checking
-actually works, not just structural parsing); an already-expired token is
-rejected with the specific `TokenExpiredError`; a token missing the `email`
-claim is rejected even though its signature is otherwise valid; and two
-regression tests for `issuer`/`audience` (§7) — a correctly-signed token
-with the *wrong* `audience`, and separately one with the wrong `issuer`, are
-both rejected even though nothing else about them is invalid, proving
-`verifyAccessToken` actually enforces those claims rather than merely
-accepting whatever (or no) value shows up.
+Confirms: sign→verify round-trips to the same `sub`/`email` **plus** a
+genuine `jti` (asserted to be a non-empty string, §7) — using `toMatchObject`
+rather than `toEqual` specifically because the exact payload now legitimately
+has more in it than just what was passed in; a second test confirms two
+separately-signed tokens for the same user get *different* `jti` values,
+locking in that it identifies the token, not the user. A token signed with a
+*different* secret is rejected (proves signature checking actually works,
+not just structural parsing); an already-expired token is rejected with the
+specific `TokenExpiredError`; a token missing the `email` claim is rejected
+even though its signature is otherwise valid; and two regression tests for
+`issuer`/`audience` — a correctly-signed token with the *wrong* `audience`,
+and separately one with the wrong `issuer`, are both rejected even though
+nothing else about them is invalid, proving `verifyAccessToken` actually
+enforces those claims rather than merely accepting whatever (or no) value
+shows up.
 
 ### `tests/unit/token.service.test.ts`
 The most involved test file, matching the most involved source file:
@@ -1805,6 +2106,10 @@ The most involved test file, matching the most involved source file:
   actually running to reach the `updateMany`/`create` calls being asserted on.
 - `revokeRefreshToken`: asserts the `updateMany` call's `where`/`data`
   shape matches what logout is supposed to do.
+- The `isActive` regression test: a stored token whose `user.isActive` is
+  `false` is rejected with the specific "no longer active" message, **and**
+  asserts `prisma.$transaction` was never even called — proving the check
+  short-circuits before any rotation work happens, not after.
 
 ### `tests/unit/oauthHandoff.service.test.ts`
 Direct tests for the handoff store (§11a), separate from the OAuth flow
@@ -1813,7 +2118,18 @@ code; confirms it's genuinely single-use (a second `consumeHandoff` of the
 same code returns `undefined`); rejects a code that was never issued; and —
 using `jest.useFakeTimers()` to fast-forward past the 60-second TTL without
 an actual 60-second test — confirms an expired code is rejected even on its
-first-ever consume attempt.
+first-ever consume attempt. A final test covers the configurable cap and
+its eviction/warning behavior (§11a): using `withFreshEnv` (see the tests
+helper section below) to require a fresh copy of the module with
+`OAUTH_HANDOFF_MAX_ENTRIES` set to a small `'3'` (rather than waiting on the
+real default of 5000), it creates exactly three handoffs, confirms
+`console.warn` (spied via `jest.spyOn`) hasn't fired yet — right at the cap,
+not over it — then creates a fourth, which pushes it over: confirms the
+warning fired exactly once, that the *oldest* of the three original codes
+is now unconsumable, and that both the newer surviving code and the
+fourth (eviction-triggering) code are still perfectly valid — proving the
+eviction targets specifically the oldest entry, not an arbitrary one, and
+doesn't collaterally break the entry that caused it.
 
 ### `tests/unit/auth.service.test.ts`
 Mocks `token.service` itself at the module level
@@ -1835,7 +2151,45 @@ fast-path check missing a real concurrent duplicate — asserts the result is
 still a clean `409`, not a `500`; a companion test rejects `create` with a
 plain, unrelated `Error` and asserts that one is genuinely re-thrown as-is,
 proving the `catch` block only special-cases `P2002` and doesn't swallow or
-mislabel other database failures.
+mislabel other database failures. A dedicated test also confirms a disabled
+account (`isActive: false`) is rejected with the same generic message as
+everything else, and — using `jest.spyOn(passwordUtils, 'comparePassword')`
+— that `comparePassword` is never even called for it, proving the `isActive`
+check really does run before the password comparison, not just before the
+tokens get issued.
+
+A whole nested `describe('account lockout', ...)` block covers the lockout
+mechanism in `login()` (§10) on its own:
+- A wrong password with some prior failures increments
+  `failedLoginAttempts` by exactly one and leaves `lockedUntil: null` —
+  asserting the *exact* `prisma.user.update` call shape, not just that
+  *an* update happened, catches an off-by-one as readily as a missing call.
+- Reaching `env.LOCKOUT_MAX_ATTEMPTS` on a wrong password sets
+  `lockedUntil` to a real future `Date`, checked with a range assertion
+  (`getTime()` between "now" and "now + LOCKOUT_DURATION_MS + a second of
+  slack for test execution time") rather than an exact timestamp, since the
+  function computes `Date.now()` internally at call time — an exact-match
+  assertion would be flaky by construction.
+- A currently-locked account rejects even the **correct** password —
+  deliberately used in this test, not a wrong one, to prove the lock itself
+  is what's blocking access, not incidentally a bad password — and, using
+  the same `comparePassword` spy technique as the disabled-account test
+  above, confirms it's rejected *before* the password is ever compared, and
+  that no database write happens for an attempt that never got that far.
+- Feeding in a user whose `failedLoginAttempts` is at the limit but whose
+  `lockedUntil` is a timestamp in the *past* (an expired lock) and supplying
+  a wrong password again confirms the count resets to `1`, not
+  `LOCKOUT_MAX_ATTEMPTS + 1` — the direct regression test for the "expired
+  lock gets a fresh budget, not an instant re-lock" logic explained in §10.
+- A successful login after prior failures asserts the exact
+  `{ failedLoginAttempts: 0, lockedUntil: null }` reset call; a companion
+  test with a *clean* history (zero prior attempts) asserts `update` is
+  **not** called at all, locking in the "don't write to the database when
+  there's nothing to reset" optimization.
+- A final test confirms lockout bookkeeping is untouched entirely for both
+  a nonexistent account and a Google-only one — there's no row to track
+  attempts against in the first case, and no password to have been guessed
+  wrong in a way lockout should care about in the second.
 
 ### `tests/unit/google.service.test.ts`
 Covers all three branches of `findOrCreateGoogleUser` from §11: already
@@ -1852,6 +2206,15 @@ mocked to reject with a real `P2002` error, `findFirst` mocked to return a
 asserts the function returns that winner rather than throwing, and that
 `findFirst` really was called exactly twice; a companion test confirms an
 unrelated `Error` from `create` is re-thrown as-is, not misreported as a race.
+Two more tests cover the equivalent race on the `update()`/linking path
+(§11): one where the re-fetch-by-`googleId` after a `P2002` finds a row with
+the **same** email as the one being linked — asserts the function returns
+that row (the benign-race outcome), and that the re-fetch used
+`prisma.user.findUnique({ where: { googleId } })` specifically; a second
+where the re-fetch finds a row with a **different** email — asserts a
+distinct `409 "already linked to a different user"` is thrown instead,
+proving the genuine-conflict branch doesn't get collapsed into the
+benign-race one just because both start from the same `P2002`.
 
 ### `tests/unit/validate.middleware.test.ts`
 Didn't exist before this round of fixes. Confirms the core behavior (an
@@ -1892,13 +2255,59 @@ response), not `429`. An earlier version of the rate limiter, reused across
 every route, would have failed that last assertion — `/refresh` would have
 inherited `/login`'s exhausted budget.
 
+### `tests/helpers/freshEnv.ts`
+Not a test file itself — a shared helper (`withFreshEnv`), extracted out of
+what was originally `corsConfig.test.ts`'s own local function once
+`envValidation.test.ts` needed the exact same capability: given some env var
+overrides, seed a full set of required values, run a callback inside
+`jest.isolateModules(...)` (so any `require(...)` inside it resolves against
+a genuinely fresh module registry, picking up a freshly-parsed `env.ts`),
+then restore `process.env` afterward. See the note on `corsConfig.test.ts`
+below for *why* this level of isolation is necessary at all, not just
+convenient.
+
+### `tests/unit/envValidation.test.ts`
+Covers the `JWT_ACCESS_TTL` positivity check (§3) via `withFreshEnv`: a
+normal value like `"15m"` is accepted and passed through unchanged;
+`it.each(['0', '0s', '0m', '0.0h', '0d'])` drives the same assertion
+("this must throw") across five different zero-duration spellings in one
+parameterized test, rather than five near-identical `it` blocks, since the
+point being proven — the `.refine()` catches *any* shape of zero, not one
+specific string — is the same for every case; a plain garbage value
+(`"banana"`) still fails the original format regex, confirming that check
+wasn't accidentally weakened; and `"0.5h"` (a fractional value that
+resolves to a nonzero duration) is accepted, confirming the new check isn't
+overly broad and rejecting legitimate fractional TTLs along with the zero
+ones.
+
+### `tests/unit/email.test.ts`
+Direct tests for `normalizeEmail` (§10) that didn't have their own file
+before this round — trim + lowercase is confirmed as before, but the
+Unicode-normalization regression test is the one worth reading closely: it
+builds an NFC-encoded "é" and an NFD-encoded "é" with `String.fromCodePoint`
+from explicit hex codepoints (`0x00e9` vs. `0x0065, 0x0301`) rather than
+typing the accented character directly into the source file. That's not
+paranoia for its own sake — it's a real risk specific to *this* test: typing
+a literal accented character can get silently normalized by an editor, a
+save pipeline, or even this very authoring session's own tools, at which
+point both "different" strings in the test would already be identical
+before `normalizeEmail` ever ran, and the test would pass for the wrong
+reason (or rather, for no reason) regardless of whether the function under
+test actually normalizes anything. Building both forms programmatically at
+runtime sidesteps that risk entirely. The test then asserts the two raw
+strings are provably different (different `.length`, not just `!==`, which
+Unicode-normalized-vs-not strings can sometimes share) before confirming
+`normalizeEmail` collapses them to the same output. A final test confirms
+idempotence — normalizing an already-normalized email is a no-op.
+
 ### `tests/unit/corsConfig.test.ts`
 The one file in this suite that needs true module-level isolation to test
 at all, because `env.ts` parses `process.env` exactly once, at import time
 — proving "this exact `process.env` produces this exact behavior" means
 starting from a genuinely fresh module registry per case
-(`jest.isolateModules(...)`), not just reassigning `process.env` after
-`env.ts` has already run once and cached its answer. Two groups:
+(`jest.isolateModules(...)`, via the shared `withFreshEnv` helper above),
+not just reassigning `process.env` after `env.ts` has already run once and
+cached its answer. Two groups:
 - **`ALLOW_ANY_CORS_ORIGIN` parsing** — `"false"` parses to real `false`
   (the direct regression test for the `z.coerce.boolean()` footgun
   described in §3 — asserted with `toBe(false)`, not a looser truthy check,
@@ -1932,15 +2341,42 @@ full valid signup → `201`, and the response JSON genuinely has no
 check) → `409`; duplicate email caught only by the database's own unique
 constraint (a mocked `P2002` from `create`, same as the service-level test
 above but exercised through the full HTTP stack) → `409`, not `500`; login
-against a nonexistent account → `401`; `/me` with no auth header → `401`;
+against a nonexistent account → `401`; `/me` with no auth header → `401`.
+
+`/me` also gets two more targeted tests once `isActive` entered the
+picture (§12): a real, validly-signed access token (via `signAccessToken`,
+same as `auth.middleware.ts` would produce) for a user whose mocked
+`prisma.user.findUnique` returns `isActive: false` gets `403`; the same
+setup with `isActive: true` gets `200` with the expected user back — proving
+the check actually branches both ways, not just that it exists.
+
 `GET /auth/google` → a real `302` redirect whose `Location` header points at
 `accounts.google.com`, with the `oauth_state` cookie actually set on the
-response; `POST /auth/google/exchange` → an unknown code rejected with
-`400`, and a code obtained by calling `createHandoff` directly (standing in
-for what `googleCallback` would have done) successfully exchanged once and
-rejected the second time it's tried — proving the single-use property holds
-through the actual route, not just the service function in isolation; a
-body over `JSON_BODY_LIMIT` → `413`, and malformed JSON → `400` — both the
+response — plus a dedicated test confirming a `ratelimit-limit` response
+header is present at all (the regression test for the "Google routes had no
+rate limiting" fix, §17), and the same header check repeated for `GET
+/auth/google/callback`. A further `google/callback` test drives a rejected
+callback (mismatched `state`) and inspects the actual `Set-Cookie` header
+Express sent for clearing `oauth_state` — asserting it contains both
+`HttpOnly` and `SameSite=Lax`, not just that *a* clearing cookie was sent —
+the direct regression test for the cookie-options-mismatch fix (§12): before
+that fix, this exact assertion would have failed, because the clearing call
+carried no attributes at all.
+
+`POST /auth/google/exchange` → an unknown code rejected with `400`, and a
+code obtained by calling `createHandoff` directly (standing in for what
+`googleCallback` would have done) successfully exchanged once and rejected
+the second time it's tried — proving the single-use property holds through
+the actual route, not just the service function in isolation.
+
+A `describe('hardened response headers', ...)` block hits a plain `GET
+/health` and asserts `Cache-Control: no-store` is present exactly, and that
+`Permissions-Policy` contains `camera=()`, `microphone=()`, and
+`geolocation=()` — the regression test for §18's added headers, deliberately
+run against the *least* auth-specific route in the app, to confirm the
+headers apply globally rather than being scoped only to `/api/auth/*`.
+
+A body over `JSON_BODY_LIMIT` → `413`, and malformed JSON → `400` — both the
 direct regression test for the `error.middleware.ts` fix (§14): before that
 fix, both of these came back a generic `500`; any unrecognized route → a
 clean `404` JSON error (proving `notFoundHandler` is wired in correctly).

@@ -1,5 +1,6 @@
 import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
+import { env } from '../config/env';
 import { AppError } from '../utils/AppError';
 import { hashPassword, comparePassword } from '../utils/password';
 import { normalizeEmail } from '../utils/email';
@@ -73,18 +74,77 @@ export async function login(input: LoginInput): Promise<AuthResult> {
   const user = await prisma.user.findUnique({ where: { email } });
 
   // Same generic message whether the account doesn't exist, has no password
-  // (Google-only account), or the password is wrong — unlike signup, this is
-  // an attacker-facing endpoint where confirming account existence would aid
-  // credential-stuffing/enumeration.
+  // (Google-only account), the password is wrong, or the account is
+  // currently locked out — unlike signup, this is an attacker-facing
+  // endpoint where confirming account existence (or lockout state, which
+  // just as surely confirms existence) would aid credential-stuffing/
+  // enumeration.
   const invalidCredentials = () => new AppError(401, 'Invalid email or password');
 
   if (!user || !user.passwordHash) {
+    // No account, or a Google-only account — either way there's no password
+    // to guess against and no row to track failed attempts on, so lockout
+    // doesn't apply; this is the same "nothing to do" case it always was.
+    throw invalidCredentials();
+  }
+
+  if (!user.isActive) {
+    // Same generic message as everything else here, deliberately — a
+    // disabled account is treated exactly like a nonexistent one from the
+    // outside, for the same enumeration-resistance reason. Checked before
+    // lockout/password logic runs at all: there's no reason to track failed
+    // attempts, or pay bcrypt's cost, against an account that can never
+    // succeed regardless of what's typed.
+    throw invalidCredentials();
+  }
+
+  const isLocked = user.lockedUntil !== null && user.lockedUntil > new Date();
+  if (isLocked) {
+    // Rejected before ever touching bcrypt — on top of not leaking lockout
+    // state via a different message, this also means a locked-out account
+    // doesn't pay comparePassword's ~50-100ms cost per guess, which is a
+    // small extra brake on an attacker hammering it during the lockout window.
     throw invalidCredentials();
   }
 
   const passwordMatches = await comparePassword(input.password, user.passwordHash);
+
   if (!passwordMatches) {
+    // Account-level lockout — a self-clearing throttle *per account*, on
+    // top of (not instead of) the per-IP rate limiting in
+    // rateLimit.middleware.ts. That limiter can't stop an attacker who
+    // spreads guesses across many IPs against one specific account; this
+    // closes that gap by counting failures on the account itself.
+    //
+    // `user.lockedUntil !== null` (checked here, not just "is it still in
+    // the future" — already ruled out above) is the signal an earlier
+    // lockout happened and has since expired: that gets a fresh count
+    // rather than starting permanently pinned at the limit, since without
+    // this a user who once got locked out would re-lock on their very next
+    // mistake, forever, instead of getting a normal-length grace window again.
+    const attemptsBeforeThisOne = user.lockedUntil !== null ? 0 : user.failedLoginAttempts;
+    const attempts = attemptsBeforeThisOne + 1;
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        failedLoginAttempts: attempts,
+        lockedUntil:
+          attempts >= env.LOCKOUT_MAX_ATTEMPTS
+            ? new Date(Date.now() + env.LOCKOUT_DURATION_MS)
+            : null,
+      },
+    });
     throw invalidCredentials();
+  }
+
+  // Correct password — fully clear any lockout state, successful or not
+  // (an expired-but-still-set lockedUntil is cleared here too, not just a
+  // live one), so a legitimate login always starts the count over at zero.
+  if (user.failedLoginAttempts > 0 || user.lockedUntil !== null) {
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { failedLoginAttempts: 0, lockedUntil: null },
+    });
   }
 
   const tokens = await issueTokenPair(user);

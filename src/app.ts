@@ -52,6 +52,27 @@ export function createApp() {
   }
 
   app.use(helmet());
+  // helmet() covers the general-purpose security headers (a conservative
+  // CSP, X-Content-Type-Options, HSTS, etc.) but it's generic middleware —
+  // it has no way to know this specific API's responses carry access/refresh
+  // tokens and user data that must never be cached or handed to a browser
+  // feature that has no business touching them. Two headers helmet doesn't
+  // (and can't, without knowing that) set on its own:
+  app.use((_req, res, next) => {
+    // Told to browsers AND any intermediate cache/proxy: never store this
+    // response. Without it, a shared/corporate proxy — or just the
+    // browser's own disk cache — could retain a response containing a
+    // freshly-issued access/refresh token or a user's profile data.
+    res.setHeader('Cache-Control', 'no-store');
+    // This is a JSON API with no UI of its own — it never needs camera,
+    // microphone, geolocation, or payment-handling access in a browser
+    // context. Explicitly disabling them is defense-in-depth: irrelevant to
+    // a well-behaved client, but closes off those APIs from ever being
+    // invoked in a browser context that somehow ends up rendering this
+    // response directly (e.g. a misconfigured client, or a future bug).
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=()');
+    next();
+  });
   app.use(cors({ origin: corsOrigin() }));
   // Explicit limit (rather than relying on body-parser's own unmentioned
   // 100kb default) — this API only ever expects a few short string fields,

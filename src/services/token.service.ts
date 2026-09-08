@@ -79,6 +79,19 @@ export async function rotateRefreshToken(rawRefreshToken: string): Promise<Token
   if (stored.expiresAt < new Date()) {
     throw new AppError(401, 'Refresh token has expired');
   }
+  if (!stored.user.isActive) {
+    // Closes the same gap login() guards against, on the other place a
+    // disabled account could otherwise keep working indefinitely: without
+    // this, an already-issued refresh token would happily keep minting
+    // fresh access tokens for a disabled account forever, even though
+    // login() itself now refuses that account from the front door. A
+    // distinct message is fine here (unlike login's deliberately generic
+    // one) — this isn't a public, guessable-credential endpoint; reaching
+    // this line already requires possessing a specific, high-entropy
+    // refresh token, so there's no meaningful enumeration risk in being
+    // specific about why it stopped working.
+    throw new AppError(401, 'This account is no longer active');
+  }
 
   const newRawRefreshToken = generateRawRefreshToken();
   const newTokenHash = hashToken(newRawRefreshToken);

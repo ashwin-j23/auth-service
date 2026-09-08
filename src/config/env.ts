@@ -20,6 +20,16 @@ const envSchema = z.object({
       /^\d+$|^\d+(\.\d+)?\s?(ms|s|m|h|d|w|y)$/,
       'JWT_ACCESS_TTL must be a number of seconds, or a value like "15m", "1h", "7d"',
     )
+    // The regex above only checks *shape* — "0", "0s", "0.0m" all match it
+    // just as validly as "15m" does, since `\d+` allows a literal zero. A
+    // zero-second TTL isn't a format error, so the regex alone can't catch
+    // it, but it's a real misconfiguration: every token would be born
+    // already at (or a moment past) its own expiry, and "every single
+    // request is unauthorized" is a nasty thing to have to debug in
+    // production when the actual cause is one wrong config value. Parsing
+    // the leading number out and checking it's strictly positive catches
+    // that at boot instead.
+    .refine((v) => parseFloat(v) > 0, 'JWT_ACCESS_TTL must be greater than zero')
     .default('15m'),
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(7),
 
@@ -92,6 +102,21 @@ const envSchema = z.object({
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(15 * 60 * 1000),
   RATE_LIMIT_STRICT_MAX: z.coerce.number().int().positive().default(30),
   RATE_LIMIT_STANDARD_MAX: z.coerce.number().int().positive().default(100),
+
+  // Backstop cap on oauthHandoff.service.ts's in-memory store (on top of its
+  // TTL-based purge) — see that file for the full reasoning. Configurable,
+  // and defaulted high (5000, not the original 1000), specifically so a
+  // realistic burst of legitimate logins can't evict a genuine not-yet-
+  // exchanged handoff before its own ~60s TTL naturally expires it.
+  OAUTH_HANDOFF_MAX_ENTRIES: z.coerce.number().int().positive().default(5000),
+
+  // Account-level login lockout (auth.service.ts) — a self-clearing
+  // throttle on top of (not instead of) the per-IP rate limiting in
+  // rateLimit.middleware.ts. That's IP-based, so an attacker spreading
+  // guesses across many IPs against one specific account wouldn't trip it;
+  // this closes that gap by tracking failed attempts per-account instead.
+  LOCKOUT_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
+  LOCKOUT_DURATION_MS: z.coerce.number().int().positive().default(15 * 60 * 1000),
 });
 
 // Fails fast on boot (or on first import in tests — see tests/setup.ts, which

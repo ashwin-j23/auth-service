@@ -15,6 +15,9 @@ const fakeUser: User = {
   name: 'Jane',
   googleId: null,
   isEmailVerified: false,
+  failedLoginAttempts: 0,
+  lockedUntil: null,
+  isActive: true,
   createdAt: new Date(),
   updatedAt: new Date(),
 };
@@ -40,7 +43,7 @@ describe('token.service', () => {
 
       const pair = await issueTokenPair(fakeUser);
 
-      expect(verifyAccessToken(pair.accessToken)).toEqual({
+      expect(verifyAccessToken(pair.accessToken)).toMatchObject({
         sub: fakeUser.id,
         email: fakeUser.email,
       });
@@ -81,6 +84,17 @@ describe('token.service', () => {
       );
     });
 
+    it('rejects rotation for a disabled account, even with an otherwise-valid token', async () => {
+      const stored = fakeStoredRefreshToken({ user: { ...fakeUser, isActive: false } });
+      prismaMock.refreshToken.findUnique.mockResolvedValue(stored);
+
+      await expect(rotateRefreshToken('token-for-disabled-user')).rejects.toThrow(
+        'This account is no longer active',
+      );
+      // Must not have claimed/rotated the token on the way to rejecting it.
+      expect(prismaMock.$transaction).not.toHaveBeenCalled();
+    });
+
     it('rotates a valid token: claims it atomically and issues a new pair', async () => {
       const stored = fakeStoredRefreshToken();
       prismaMock.refreshToken.findUnique.mockResolvedValue(stored);
@@ -92,7 +106,7 @@ describe('token.service', () => {
 
       const pair = await rotateRefreshToken('valid-raw-token');
 
-      expect(verifyAccessToken(pair.accessToken)).toEqual({
+      expect(verifyAccessToken(pair.accessToken)).toMatchObject({
         sub: fakeUser.id,
         email: fakeUser.email,
       });

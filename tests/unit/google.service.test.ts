@@ -11,6 +11,9 @@ function buildUser(overrides: Partial<User> = {}): User {
     name: 'Jane',
     googleId: null,
     isEmailVerified: false,
+    failedLoginAttempts: 0,
+    lockedUntil: null,
+    isActive: true,
     createdAt: new Date(),
     updatedAt: new Date(),
     ...overrides,
@@ -51,6 +54,56 @@ describe('google.service findOrCreateGoogleUser', () => {
       }),
     );
     expect(result.googleId).toBe(profile.googleId);
+  });
+
+  it('closes the concurrent-link race: a P2002 from update() resolves to the already-linked row', async () => {
+    // Simulates two simultaneous Google logins for the same account being
+    // linked for the first time: this call's findFirst still sees
+    // googleId: null (the other caller hasn't committed yet), so it
+    // proceeds to update() — which is where the real `googleId` unique
+    // constraint catches it, because the other caller's update already won.
+    const existing = buildUser({ googleId: null });
+    const winner = buildUser({ ...existing, googleId: profile.googleId });
+    prismaMock.user.findFirst.mockResolvedValueOnce(existing);
+    prismaMock.user.update.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError('Unique constraint failed on the fields: (`googleId`)', {
+        code: 'P2002',
+        clientVersion: '5.22.0',
+      }),
+    );
+    prismaMock.user.findUnique.mockResolvedValue(winner); // re-fetch by googleId
+
+    const result = await findOrCreateGoogleUser(profile);
+
+    expect(result).toBe(winner);
+    expect(prismaMock.user.findUnique).toHaveBeenCalledWith({
+      where: { googleId: profile.googleId },
+    });
+  });
+
+  it('does NOT silently hand back a different account when the P2002 is a genuine conflict, not a race', async () => {
+    // This googleId is already claimed, but by a DIFFERENT user entirely —
+    // re-fetching by googleId finds someone whose email doesn't match the
+    // row we were trying to link. That's a real conflict, not two callers
+    // racing to link the same account, and must not be silently papered over.
+    const existing = buildUser({ id: 'user-1', email: 'jane@example.com', googleId: null });
+    const someoneElse = buildUser({
+      id: 'user-2',
+      email: 'someone-else@example.com',
+      googleId: profile.googleId,
+    });
+    prismaMock.user.findFirst.mockResolvedValueOnce(existing);
+    prismaMock.user.update.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError('Unique constraint failed on the fields: (`googleId`)', {
+        code: 'P2002',
+        clientVersion: '5.22.0',
+      }),
+    );
+    prismaMock.user.findUnique.mockResolvedValue(someoneElse);
+
+    await expect(findOrCreateGoogleUser(profile)).rejects.toMatchObject(
+      new AppError(409, 'This Google account is already linked to a different user'),
+    );
   });
 
   it('refuses to link an existing account when Google has not verified the email', async () => {

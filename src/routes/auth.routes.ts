@@ -28,8 +28,16 @@ authRouter.post(
 );
 authRouter.get('/me', requireAuth, authController.me);
 
-authRouter.get('/google', authController.googleRedirect);
-authRouter.get('/google/callback', authController.googleCallback);
+// standardAuthRateLimiter, not strict — these are driven by a browser
+// following redirects (Google's, then this app's own), not something a
+// client calls repeatedly in a tight loop under normal use, but neither
+// route did any bounding at all before this: /google is cheap (just issues
+// a cookie + redirect) but still worth a basic backstop, and /google/callback
+// does real work per call — a Google token exchange, an ID-token
+// verification, a database read/write — none of which should be reachable
+// at unlimited volume just because it's a GET route.
+authRouter.get('/google', standardAuthRateLimiter, authController.googleRedirect);
+authRouter.get('/google/callback', standardAuthRateLimiter, authController.googleCallback);
 authRouter.post(
   '/google/exchange',
   standardAuthRateLimiter,

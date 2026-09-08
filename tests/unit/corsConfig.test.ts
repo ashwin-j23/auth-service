@@ -1,37 +1,4 @@
-/**
- * These two behaviors specifically need module-level isolation to test at
- * all: env.ts parses `process.env` once, at import time, into the `env`
- * object every other file imports — so proving "a given process.env
- * produces this exact behavior" means starting from a genuinely fresh
- * module registry for each case, not just reassigning process.env after
- * env.ts has already run.
- */
-
-const REQUIRED_ENV = {
-  DATABASE_URL: 'postgresql://x/y',
-  JWT_ACCESS_SECRET: 'x'.repeat(20),
-  COOKIE_SECRET: 'x'.repeat(20),
-  GOOGLE_CLIENT_ID: 'client-id',
-  GOOGLE_CLIENT_SECRET: 'client-secret',
-  GOOGLE_REDIRECT_URI: 'http://localhost:4000/api/auth/google/callback',
-  OAUTH_SUCCESS_REDIRECT_URL: 'http://localhost:3000/oauth/callback',
-};
-
-function withFreshEnv<T>(overrides: Record<string, string | undefined>, run: () => T): T {
-  const savedEnv = { ...process.env };
-  Object.assign(process.env, REQUIRED_ENV, overrides);
-  for (const [key, value] of Object.entries(overrides)) {
-    if (value === undefined) delete process.env[key];
-  }
-
-  let result!: T;
-  jest.isolateModules(() => {
-    result = run();
-  });
-
-  process.env = savedEnv;
-  return result;
-}
+import { withFreshEnv } from '../helpers/freshEnv';
 
 describe('ALLOW_ANY_CORS_ORIGIN parsing (env.ts)', () => {
   it('"false" parses to boolean false, not true', () => {

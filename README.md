@@ -36,6 +36,9 @@ npx prisma migrate dev --name init   # creates the users / refresh_tokens tables
 npm run dev                          # http://localhost:4000
 ```
 
+If you set up the database before this `isActive`/lockout addition, run
+`npx prisma migrate dev` again to pick up the new columns.
+
 ## Tests
 
 ```bash
@@ -46,28 +49,35 @@ Unit tests never touch a real database — Prisma is replaced with a deep mock
 (`tests/mocks/prisma.mock.ts`), so they run instantly and deterministically.
 See EXPLANATION.md for how the mocking works and what each test covers.
 
-This has actually been run, not just written: 70 tests passing, `tsc --noEmit`
+This has actually been run, not just written: 100 tests passing, `tsc --noEmit`
 clean, and the full HTTP flow (signup/login/refresh rotation/reuse-detection/
-Google redirect/CORS behavior/trust-proxy/body-size-limit/graceful shutdown)
+Google redirect/CORS behavior/trust-proxy/body-size-limit/graceful shutdown/
+account lockout/disabled-account handling/Unicode email normalization)
 exercised against a real Postgres instance — see the session transcript
 linked in the commits if you want the raw output.
 
 ## API
 
-| Method | Path                        | Auth           | Body / Query                         |
-|--------|-----------------------------|----------------|---------------------------------------|
-| Method | Path                         | Rate limit | Auth           | Body / Query                         |
-|--------|-------------------------------|------------|----------------|---------------------------------------|
+| Method | Path                         | Rate limit | Auth           | Body / Query                          |
+|--------|------------------------------|------------|----------------|-----------------------------------------|
 | POST   | `/api/auth/signup`          | strict     | —              | `{ email, password, name? }`          |
 | POST   | `/api/auth/login`           | strict     | —              | `{ email, password }`                 |
 | POST   | `/api/auth/refresh`         | standard   | —              | `{ refreshToken }`                    |
 | POST   | `/api/auth/logout`          | standard   | —              | `{ refreshToken }`                    |
-| GET    | `/api/auth/me`              | —          | Bearer token   | —                                      |
-| GET    | `/api/auth/google`          | —          | —              | redirects to Google                   |
-| GET    | `/api/auth/google/callback` | —          | —              | `?code=&state=` (set by Google)       |
+| GET    | `/api/auth/me`              | —          | Bearer token   | — (403 if the account is disabled)     |
+| GET    | `/api/auth/google`          | standard   | —              | redirects to Google                   |
+| GET    | `/api/auth/google/callback` | standard   | —              | `?code=&state=` (set by Google)       |
 | POST   | `/api/auth/google/exchange` | standard   | —              | `{ code }` (the handoff code from the callback redirect, not Google's own `code`) |
 
-"strict" and "standard" are two **separate** rate-limit budgets (`RATE_LIMIT_STRICT_MAX`/`RATE_LIMIT_STANDARD_MAX`, both per-IP) — signup/login don't share a counter with refresh/logout/exchange, so a burst on one can't lock a client out of the other.
+"strict" and "standard" are two **separate** rate-limit budgets (`RATE_LIMIT_STRICT_MAX`/`RATE_LIMIT_STANDARD_MAX`, both per-IP) — signup/login don't share a counter with refresh/logout/exchange/the Google routes, so a burst on one can't lock a client out of another.
+
+`login` also enforces an **account-level lockout**, independent of the per-IP
+limiter above: `LOCKOUT_MAX_ATTEMPTS` (default 5) wrong passwords in a row
+locks that specific account for `LOCKOUT_DURATION_MS` (default 15 minutes) —
+even to the correct password — regardless of which IP the attempts came
+from. Every response stays the same generic `401`/message whether the
+account doesn't exist, is disabled, is currently locked, or the password was
+simply wrong, so none of that is distinguishable from the outside.
 
 Signup/login/refresh responses look like:
 
@@ -118,3 +128,24 @@ about before shipping this as-is:
   dev) — if you deploy this behind nginx/an ALB/Cloudflare/etc., you
   **must** set it (see `.env.example`), or every request's `req.ip` (and
   therefore every rate limit) sees the proxy's IP, not the real client's.
+- **`isActive` (account suspension) is checked on `/me`, `login`, and
+  `refresh`** — the three places a disabled account could otherwise keep
+  working. There's no admin endpoint to actually *set* `isActive: false`
+  yet (do it directly in the database, or add one) — the enforcement is
+  built, the admin tooling to drive it isn't, in keeping with this
+  project's scope.
+- **Access tokens carry a `jti` (unique per-token ID) but nothing checks it
+  yet** — there's no revocation list. A compromised or otherwise-bad access
+  token stays valid until it naturally expires (15 minutes by default); it
+  can't be individually invalidated early. The `jti` is there as groundwork
+  for that (a revocation list needs a per-token identifier to blocklist) —
+  implementing the list itself needs a shared store (e.g. Redis) checked on
+  every authenticated request, a real latency/infrastructure tradeoff
+  against the current fully-stateless design, deferred until immediate
+  token revocation is an actual requirement.
+- **`OAUTH_HANDOFF_MAX_ENTRIES` (default 5000) is a memory bound, not a
+  free one** — hitting it evicts an unexpired, not-yet-exchanged handoff,
+  which would fail that one user's in-progress login. Sized high enough
+  that only a genuinely abnormal volume of concurrent, unexchanged Google
+  logins would ever reach it; a warning is logged if it does, so it's
+  observable rather than a silent, confusing one-off failure.

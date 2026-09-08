@@ -4,10 +4,20 @@ import { signAccessToken, verifyAccessToken } from '../../src/utils/jwt';
 describe('jwt utils', () => {
   const payload = { sub: 'user-123', email: 'jane@example.com' };
 
-  it('signs a token that verifies back to the same payload', () => {
+  it('signs a token that verifies back to the same payload, plus a jti', () => {
     const token = signAccessToken(payload);
     const decoded = verifyAccessToken(token);
-    expect(decoded).toEqual(payload);
+    expect(decoded).toMatchObject(payload);
+    expect(typeof decoded.jti).toBe('string');
+    expect(decoded.jti.length).toBeGreaterThan(0);
+  });
+
+  it('gives two separately-signed tokens for the same user different jti values', () => {
+    // jti identifies a specific TOKEN, not the user — groundwork for a
+    // future per-token revocation list (see the comment in jwt.ts).
+    const tokenA = signAccessToken(payload);
+    const tokenB = signAccessToken(payload);
+    expect(verifyAccessToken(tokenA).jti).not.toBe(verifyAccessToken(tokenB).jti);
   });
 
   it('throws on a token signed with a different secret', () => {

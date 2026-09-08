@@ -19,6 +19,18 @@ model User {
   // Google's stable "sub" claim. Null until the account is linked to Google.
   googleId        String?   @unique
   isEmailVerified Boolean   @default(false)
+
+  // Account-level login lockout (auth.service.ts). Reset to 0 / null on
+  // every successful password login; incremented on every failed one.
+  // Deliberately separate from any future admin-driven suspension —
+  // this is a self-clearing, temporary throttle, not a permanent flag.
+  failedLoginAttempts Int      @default(0)
+  lockedUntil         DateTime?
+
+  // Permanent, admin-driven account suspension (distinct from the
+  // temporary lockout above) — checked in GET /me (auth.controller.ts).
+  isActive        Boolean   @default(true)
+
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 

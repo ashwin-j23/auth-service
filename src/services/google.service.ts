@@ -97,10 +97,30 @@ export async function findOrCreateGoogleUser(profile: GoogleProfile) {
     if (!profile.emailVerified) {
       throw new AppError(400, 'Google account email is not verified');
     }
-    return prisma.user.update({
-      where: { id: existing.id },
-      data: { googleId: profile.googleId, isEmailVerified: true },
-    });
+    try {
+      return await prisma.user.update({
+        where: { id: existing.id },
+        data: { googleId: profile.googleId, isEmailVerified: true },
+      });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        // `googleId` is @unique, and this update is racing whatever else
+        // might be claiming it concurrently — most plausibly the same
+        // login double-firing (a double-click, two tabs), in which case
+        // some other in-flight request already set this exact googleId on
+        // this exact row, and re-reading it is the correct outcome, not a
+        // failure. But it's also possible (correctly) rejected: this
+        // googleId already belongs to a genuinely DIFFERENT user account —
+        // that's a real conflict, not a race, and must not be silently
+        // papered over by handing back the wrong user.
+        const winner = await prisma.user.findUnique({ where: { googleId: profile.googleId } });
+        if (winner && winner.email === existing.email) {
+          return winner;
+        }
+        throw new AppError(409, 'This Google account is already linked to a different user');
+      }
+      throw err;
+    }
   }
 
   // Same TOCTOU shape as auth.service.ts's signup() (see EXPLANATION.md §10):
