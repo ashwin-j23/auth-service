@@ -186,7 +186,27 @@ const envSchema = z.object({
   GOOGLE_CLIENT_SECRET: z.string().min(1, 'GOOGLE_CLIENT_SECRET is required'),
   GOOGLE_REDIRECT_URI: z.string().url(),
   OAUTH_SUCCESS_REDIRECT_URL: z.string().url(),
-  CORS_ALLOWED_ORIGINS: z.string().optional(),
+  CORS_ALLOWED_ORIGINS: z
+    .string()
+    .optional()
+    .transform((value, ctx) => {
+      if (value === undefined) return undefined;
+      const origins = value
+        .split(',')
+        .map((origin) => origin.trim())
+        .filter((origin) => origin.length > 0);
+      if (origins.length === 0) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: '...' });
+        return z.NEVER;
+      }
+      const originPattern = /^https?:\/\/[^\s/]+$/;
+      const invalid = origins.filter((origin) => !originPattern.test(origin));
+      if (invalid.length > 0) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: '...' });
+        return z.NEVER;
+      }
+      return origins;
+    }),
   ALLOW_ANY_CORS_ORIGIN: z
     .enum(['true', 'false'])
     .default('false')
@@ -240,9 +260,34 @@ export const env = envSchema.parse(process.env);
   a nasty thing to debug when the real cause is one wrong config value three
   layers away. `parseFloat("0s")` is `0`, `parseFloat("15m")` is `15` — the
   refine reads past the unit and checks the number itself.
-- `CORS_ALLOWED_ORIGINS` is `.optional()`, and `ALLOW_ANY_CORS_ORIGIN` is the
-  *only* other input `app.ts`'s CORS logic (§18) looks at — deliberately not
-  `NODE_ENV`. An earlier version of that logic branched on
+- `CORS_ALLOWED_ORIGINS`'s `.transform(...)` does two jobs at once: **parse**
+  (split on `,`, trim each piece) and **validate**, in the same pass, rather
+  than a bare `z.string().optional()` that just hands `app.ts` a raw string
+  to `.split(',')` itself later. That distinction matters for a real failure
+  mode a bare split doesn't catch: `CORS_ALLOWED_ORIGINS=""`, `","`, or a
+  value with a stray trailing comma each produce one or more empty-string
+  entries once split. `cors`'s origin-matching would never actually treat an
+  empty-string entry as "allow anything" — a real browser `Origin` header is
+  never an empty string, so nothing would ever match it — but it would
+  silently produce a broken, useless allowlist with no error telling the
+  operator their config typo means "no origin will ever be allowed." The
+  `.filter((origin) => origin.length > 0)` step removes harmless stray empty
+  segments (a single trailing comma after an otherwise-valid origin is
+  simply tolerated), but if *every* segment was empty — nothing usable
+  remains — that's rejected outright via `ctx.addIssue(...)` +
+  `return z.NEVER` (zod's way of failing a `.transform()`, the same
+  mechanism `ALLOW_ANY_CORS_ORIGIN` doesn't need since `.enum()` fails on
+  its own). The second check, `originPattern.test(...)`, catches the other
+  way this can be wrong: an origin with a path or trailing slash
+  (`https://example.com/callback`) or missing a scheme entirely
+  (`example.com`) — never valid values for what an `Origin` header actually
+  looks like, so also rejected at boot rather than silently compiled into an
+  allowlist that will never match a real request. The output type is also
+  `string[] | undefined` directly (not `string | undefined`), so `app.ts`
+  doesn't need to re-parse this value at all — just use it.
+- `ALLOW_ANY_CORS_ORIGIN` is the *only* other input `app.ts`'s CORS logic
+  (§18) looks at — deliberately not `NODE_ENV`. An earlier version of that
+  logic branched on
   `NODE_ENV === 'production'` (later `=== 'development'`) to decide whether
   cross-origin requests should be wide open by default; either way, that ties
   a security-relevant default to a setting (`NODE_ENV`, defaulted to
@@ -1211,13 +1256,10 @@ function purgeExpired(): void {
 export function createHandoff(user: PublicUser, tokens: TokenPair): string {
   purgeExpired();
   if (store.size >= env.OAUTH_HANDOFF_MAX_ENTRIES) {
-    const oldestKey = store.keys().next().value;
-    if (oldestKey !== undefined) {
-      console.warn(
-        `oauthHandoff: evicting an unexpired handoff entry — store hit its ${env.OAUTH_HANDOFF_MAX_ENTRIES}-entry cap. A legitimate pending login may fail.`,
-      );
-      store.delete(oldestKey);
-    }
+    console.error(
+      `oauthHandoff: store is full (${env.OAUTH_HANDOFF_MAX_ENTRIES} entries) — rejecting a new handoff rather than evicting someone else's pending login.`,
+    );
+    throw new AppError(503, 'Too many sign-ins in progress right now — please try again');
   }
   const code = crypto.randomBytes(24).toString('hex');
   store.set(code, { user, tokens, expiresAt: Date.now() + HANDOFF_TTL_MS });
@@ -1237,22 +1279,38 @@ is a bug in the purge logic — it's just what "bounded by TTL, not by count"
 means, and in a long-running process, an unbounded burst is still a way to
 grow this map without limit.
 
-Evicting is a genuine tradeoff worth being honest about, not a free
-backstop: `store.keys().next().value` (the oldest surviving entry, since
-`Map` iterates in insertion order) belongs to someone whose login already
-*succeeded* and just hasn't finished the final exchange step yet — evicting
-it means that specific person's login now fails with "invalid or expired
-code," for a reason that has nothing to do with anything they did wrong.
-That's exactly why the default is 5000, not something tighter: reaching it
-means 5000 *genuine, successful* Google logins landed within the same ~60s
-window without being exchanged, which requires actual valid Google accounts
-completing actual consent screens — not something trivially scriptable at
-volume — making it vanishingly unlikely under realistic traffic while still
-capping worst-case memory growth. `console.warn(...)` fires exactly when
-eviction actually happens (not on every `createHandoff` call, and not
-during ordinary TTL-based purging) — deliberately, so this is the kind of
-thing that shows up in logs/monitoring rather than silently costing one
-user a confusing failed login with no trace of why.
+**What happens at the cap is worth explaining carefully, because an earlier
+version of this function got it wrong in a subtle way.** That version
+evicted the *oldest* entry (`store.keys().next().value` — `Map` iterates in
+insertion order, so that's reliably the one closest to its own natural
+expiry) to make room for the new one. It reads as a "least harm" choice —
+evict whichever entry was going to expire soonest anyway — but it's still a
+real harm, not a free backstop: that entry belongs to someone whose Google
+login already *succeeded* and who just hasn't finished the final exchange
+step yet. Evicting it fails *their* login, silently, for a reason that has
+nothing to do with anything they did — a confusing, unattributable failure
+landing on a completely different, innocent request than the one that
+actually caused the overload.
+
+The current version instead **rejects the new request** — throws `AppError(503, ...)`
+— and leaves every existing entry untouched. This is the standard answer
+for any bounded resource under pressure: when the caller has a reasonable
+fallback (here, "retry the Google login" — a completely normal recovery
+path for a transient `503`), it's better to fail the one request that's
+actually causing the overload than to reach backward and silently corrupt
+state that belongs to somebody else's already-succeeding flow. Concretely,
+that means the *4th* login attempt (once the store is holding
+`OAUTH_HANDOFF_MAX_ENTRIES` entries) is the one that fails — not some
+arbitrary earlier login that did nothing wrong. `console.error(...)` fires
+exactly when this actually happens (not on every `createHandoff` call, and
+not during ordinary TTL-based purging) — deliberately, so reaching this cap
+at all is the kind of thing that shows up in logs/monitoring, not a silent
+one-off. `OAUTH_HANDOFF_MAX_ENTRIES` defaults to 5000 specifically to make
+hitting it vanishingly unlikely under realistic traffic in the first
+place — it means 5000 genuine, successful Google logins landed within the
+same ~60s window without being exchanged, which requires actual valid
+Google accounts completing actual consent screens, not something trivially
+scriptable at volume.
 
 `crypto.randomBytes(24)` — the same cryptographically-secure random source
 used for refresh tokens (`token.service.ts`, §9) — generates the code
@@ -1390,27 +1448,30 @@ gap, not a style nit: a cookie is only reliably overwritten/cleared by a
 `Set-Cookie` response whose attributes (`Path`, `Secure`, `SameSite`, in
 particular) match how it was originally set — mismatched attributes can mean
 the browser treats the clearing response as describing a *different*
-cookie and leaves the original sitting in place. The state value used for
-*validating* the current request was already read into a local variable
-before any clearing happens either way, so this mismatch was never a bug in
-that request's own logic — but it meant the cookie could survive in the
-browser past the callback that was supposed to invalidate it, available to
-be reused in a way it was never meant to be. Sharing one constant between
-the `set` and `clear` calls makes it structurally impossible for the two to
-drift apart again.
+cookie and leaves the original sitting in place. Sharing one constant
+between the `set` and `clear` calls makes it structurally impossible for
+the two to drift apart again.
 
 ```ts
+function validateOAuthCallback(query: Request['query'], cookieState: unknown): string {
+  const { code, state } = query;
+  if (typeof code !== 'string') {
+    throw new AppError(400, 'Missing authorization code');
+  }
+  if (!state || !cookieState || state !== cookieState) {
+    throw new AppError(400, 'Invalid or missing OAuth state');
+  }
+  return code;
+}
+
 export async function googleCallback(req: Request, res: Response, next: NextFunction) {
   try {
-    const { code, state } = req.query;
     const cookieState = req.signedCookies?.[OAUTH_STATE_COOKIE];
-    res.clearCookie(OAUTH_STATE_COOKIE, OAUTH_STATE_COOKIE_OPTIONS);
-
-    if (typeof code !== 'string') {
-      throw new AppError(400, 'Missing authorization code');
-    }
-    if (!state || !cookieState || state !== cookieState) {
-      throw new AppError(400, 'Invalid or missing OAuth state');
+    let code: string;
+    try {
+      code = validateOAuthCallback(req.query, cookieState);
+    } finally {
+      res.clearCookie(OAUTH_STATE_COOKIE, OAUTH_STATE_COOKIE_OPTIONS);
     }
 
     const { user, tokens } = await googleService.loginWithGoogleCode(code);
@@ -1425,6 +1486,32 @@ export async function googleCallback(req: Request, res: Response, next: NextFunc
   }
 }
 ```
+**The ordering here — validate first, clear second — is deliberate, and an
+earlier version of this function had it backward: it called
+`res.clearCookie(...)` as the very first thing, *before* checking whether
+`code`/`state` were even present, let alone valid.** For *this specific*
+request that ordering never actually broke anything — `cookieState` is read
+into a local variable up front regardless of when the cookie gets cleared
+afterward, so the validation below always sees the right value either way.
+But it's still the wrong shape of code, and worth understanding why "no
+observed bug for this input" isn't the same as "correct": clearing a cookie
+is a side effect on the *response* — it's the function declaring "this
+attempt has been consumed" — and doing that before confirming the attempt
+was ever real means every rejected callback (a bare `GET` to this URL with
+no query params, a forged `code`/`state`, a replayed old request) still
+gets to consume the real CSRF state cookie for whatever *legitimate* OAuth
+attempt might actually be in flight in that same browser. This is the
+standard shape for any single-use security token, not specific to OAuth:
+validate first, and only *then* burn it — the same "burn after a single
+successful use" principle behind this app's own refresh-token rotation (§9)
+and handoff codes (§11a). `validateOAuthCallback` is deliberately pure — no
+`req`/`res` mutation at all, just query params in, a `code` or a thrown
+`AppError` out — specifically so it can't accidentally reach for `res`
+itself; the `try { ... } finally { res.clearCookie(...) }` wrapped around
+just that one call is what ties "we attempted to consume this state" to
+clearing the cookie, guaranteed to run exactly once whether validation
+threw or not, without smearing that side effect earlier across the
+function than it needs to be.
 This is `GET /api/auth/google/callback` — where Google redirects the browser
 back to, with `?code=...&state=...` in the URL (Google's own authorization
 `code`, not to be confused with the handoff `code` this function creates a
@@ -1788,7 +1875,10 @@ calls directly.
 ```ts
 function corsOrigin(): boolean | string[] {
   if (env.CORS_ALLOWED_ORIGINS) {
-    return env.CORS_ALLOWED_ORIGINS.split(',').map((origin) => origin.trim());
+    // Already parsed AND validated into a clean string[] by env.ts's zod
+    // schema (§3) — empty/malformed origins are rejected there, at boot, so
+    // there's nothing left to re-parse or re-check here.
+    return env.CORS_ALLOWED_ORIGINS;
   }
   return env.ALLOW_ANY_CORS_ORIGIN;
 }
@@ -2118,18 +2208,19 @@ code; confirms it's genuinely single-use (a second `consumeHandoff` of the
 same code returns `undefined`); rejects a code that was never issued; and —
 using `jest.useFakeTimers()` to fast-forward past the 60-second TTL without
 an actual 60-second test — confirms an expired code is rejected even on its
-first-ever consume attempt. A final test covers the configurable cap and
-its eviction/warning behavior (§11a): using `withFreshEnv` (see the tests
-helper section below) to require a fresh copy of the module with
-`OAUTH_HANDOFF_MAX_ENTRIES` set to a small `'3'` (rather than waiting on the
-real default of 5000), it creates exactly three handoffs, confirms
-`console.warn` (spied via `jest.spyOn`) hasn't fired yet — right at the cap,
-not over it — then creates a fourth, which pushes it over: confirms the
-warning fired exactly once, that the *oldest* of the three original codes
-is now unconsumable, and that both the newer surviving code and the
-fourth (eviction-triggering) code are still perfectly valid — proving the
-eviction targets specifically the oldest entry, not an arbitrary one, and
-doesn't collaterally break the entry that caused it.
+first-ever consume attempt. A final test covers the configurable-cap
+behavior (§11a): using `withFreshEnv` (see the tests-helper section below)
+to require a fresh copy of the module with `OAUTH_HANDOFF_MAX_ENTRIES` set
+to a small `'3'` (rather than waiting on the real default of 5000), it
+creates exactly three handoffs, confirms `console.error` (spied via
+`jest.spyOn`) hasn't fired yet — right at the cap, not over it — then
+asserts a 4th `createHandoff` call throws the specific `AppError(503, ...)`
+and that the error was logged exactly once. Critically, the test then
+`consumeHandoff`s all three *original* codes and asserts every one of them
+is still perfectly valid — this is the direct regression test for the
+reject-vs-evict fix: an earlier version of this function evicted the oldest
+of those three to make room for a 4th, which would have failed this exact
+assertion.
 
 ### `tests/unit/auth.service.test.ts`
 Mocks `token.service` itself at the module level
@@ -2266,6 +2357,44 @@ then restore `process.env` afterward. See the note on `corsConfig.test.ts`
 below for *why* this level of isolation is necessary at all, not just
 convenient.
 
+**This helper had a real bug, worth explaining precisely because of how it
+manifested.** The restore step —
+`process.env = savedEnv;` — originally ran as a plain statement after
+`jest.isolateModules(...)`, not in a `finally`. That's fine as long as
+`run()` returns normally. It is **not** fine for exactly the tests this
+helper exists to support: every "rejects a bad value" test in this suite
+calls `withFreshEnv(...)` specifically expecting the callback to throw
+(`expect(() => withFreshEnv(...)).toThrow()`). When it does, the exception
+unwinds straight out of `withFreshEnv` itself, skipping the restore line
+entirely — leaving `process.env` permanently holding that call's overrides
+for every test that ran *after* it in the same file. The failure this
+produced was genuinely confusing to chase down: a later, entirely correct
+test — say, one asserting a *valid* `CORS_ALLOWED_ORIGINS` value parses
+correctly — would fail not because of anything wrong with its own
+assertion, but because `process.env` already had a stray, invalid value
+left over from an unrelated "rejects ..." test earlier in the file, which
+that later test's own `Object.assign(process.env, REQUIRED_ENV, overrides)`
+never fully overwrote (`Object.assign` only touches the keys present in
+*that* call's overrides, not leftovers from a previous one). The fix is a
+one-line change — wrap the restore in `try { ... } finally { process.env =
+savedEnv; }` — but the *lesson* is the more general one: any test helper
+that mutates shared, global state (here, `process.env`) and restores it
+"when we're done" has to define "done" as "even if it threw," or it isn't
+actually isolating anything for exactly the negative-path tests that matter
+most.
+
+### `tests/helpers/freshEnv.test.ts`
+A direct regression test for the helper itself, not just trust that every
+test *using* it happens to look right — added once the bug described above
+was found and fixed. Confirms `process.env` is restored after a normal
+call; confirms it's restored even when the callback throws (the actual
+regression test — asserted with a matching `before`/`after` snapshot of one
+specific variable, not just "the test suite as a whole didn't fail" which
+is exactly the kind of thing that could pass for the wrong reason); and
+confirms a variable explicitly overridden to `undefined` is genuinely
+deleted during the call and correctly restored to its real prior value
+afterward, not left as `undefined` permanently.
+
 ### `tests/unit/envValidation.test.ts`
 Covers the `JWT_ACCESS_TTL` positivity check (§3) via `withFreshEnv`: a
 normal value like `"15m"` is accepted and passed through unchanged;
@@ -2301,19 +2430,29 @@ Unicode-normalized-vs-not strings can sometimes share) before confirming
 idempotence — normalizing an already-normalized email is a no-op.
 
 ### `tests/unit/corsConfig.test.ts`
-The one file in this suite that needs true module-level isolation to test
-at all, because `env.ts` parses `process.env` exactly once, at import time
-— proving "this exact `process.env` produces this exact behavior" means
+One of the files that needs true module-level isolation to test at all,
+because `env.ts` parses `process.env` exactly once, at import time —
+proving "this exact `process.env` produces this exact behavior" means
 starting from a genuinely fresh module registry per case
 (`jest.isolateModules(...)`, via the shared `withFreshEnv` helper above),
 not just reassigning `process.env` after `env.ts` has already run once and
-cached its answer. Two groups:
+cached its answer. Three groups:
 - **`ALLOW_ANY_CORS_ORIGIN` parsing** — `"false"` parses to real `false`
   (the direct regression test for the `z.coerce.boolean()` footgun
   described in §3 — asserted with `toBe(false)`, not a looser truthy check,
   specifically because the bug this guards against would make it `true`);
   `"true"` parses to `true`; unset defaults to `false`; a nonsense value
   (`"yes-please"`) is rejected outright rather than silently defaulting.
+- **`CORS_ALLOWED_ORIGINS` parsing/validation** (§3) — a single valid origin
+  parses to a one-element array; multiple comma-separated origins are
+  trimmed and parsed correctly; unset stays `undefined` (so `corsOrigin()`
+  falls through to `ALLOW_ANY_CORS_ORIGIN`); `it.each(['', ',', ' , , ', ' '])`
+  drives the "empty/comma-only value is rejected" assertion across four
+  different ways of writing "nothing usable," in one parameterized test;
+  an origin with a trailing slash, one with a path, and one missing a
+  scheme entirely are each rejected individually; and a final test confirms
+  that even one malformed origin in an otherwise-valid comma-separated list
+  fails the *whole* value, rather than silently dropping just the bad entry.
 - **CORS actually stays closed** — the scenario from the originally reported
   bug, reproduced directly: `NODE_ENV` entirely unset, no `CORS_ALLOWED_ORIGINS`,
   no `ALLOW_ANY_CORS_ORIGIN` → a real preflight `OPTIONS` request against a

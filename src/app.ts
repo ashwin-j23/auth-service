@@ -8,7 +8,10 @@ import { notFoundHandler, errorHandler } from './middleware/error.middleware';
 
 function corsOrigin(): boolean | string[] {
   if (env.CORS_ALLOWED_ORIGINS) {
-    return env.CORS_ALLOWED_ORIGINS.split(',').map((origin) => origin.trim());
+    // Already parsed AND validated into a clean string[] by env.ts's zod
+    // schema (empty/malformed entries are rejected there, at boot) — no
+    // re-parsing needed or wanted here.
+    return env.CORS_ALLOWED_ORIGINS;
   }
   // No allowlist configured: fails closed (refuses every cross-origin
   // request) UNLESS ALLOW_ANY_CORS_ORIGIN is explicitly set — deliberately

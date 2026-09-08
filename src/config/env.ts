@@ -52,8 +52,51 @@ const envSchema = z.object({
   // Comma-separated allowlist of origins allowed to call this API from a
   // browser (e.g. "https://app.example.com,https://admin.example.com").
   // See src/app.ts — unset, this means cross-origin requests are refused
-  // outright, full stop, regardless of NODE_ENV.
-  CORS_ALLOWED_ORIGINS: z.string().optional(),
+  // outright, full stop, regardless of NODE_ENV. Parsed AND validated here
+  // (not just split on `,` at the point of use) — OWASP's guidance on CORS
+  // is to whitelist specific, well-formed origins rather than trust
+  // whatever's configured without checking it, and there's a real failure
+  // mode a bare split-on-comma doesn't catch: `CORS_ALLOWED_ORIGINS=""`,
+  // `","`, or a value with a stray trailing comma
+  // (`"https://a.com,"`) all produce one or more empty-string entries in
+  // the resulting array. `cors`'s origin-matching would never actually
+  // treat that as "allow anything" (a real browser Origin header is never
+  // an empty string, so nothing would match it) — but it silently produces
+  // a broken, useless allowlist with no error telling the operator their
+  // config typo means "no origin will ever match," which is exactly the
+  // kind of misconfiguration that should fail loud at boot instead of
+  // quietly doing nothing forever. Rejecting empty/malformed origins here,
+  // the same way JWT_ACCESS_TTL's zero-check does, closes that gap; the
+  // output type also becomes `string[] | undefined` directly, so app.ts
+  // doesn't need to re-parse this value itself.
+  CORS_ALLOWED_ORIGINS: z
+    .string()
+    .optional()
+    .transform((value, ctx) => {
+      if (value === undefined) return undefined;
+      const origins = value
+        .split(',')
+        .map((origin) => origin.trim())
+        .filter((origin) => origin.length > 0);
+      if (origins.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message:
+            'CORS_ALLOWED_ORIGINS is set but contains no usable origin (empty, or only commas/whitespace) — remove it entirely to fail closed, or provide at least one real origin',
+        });
+        return z.NEVER;
+      }
+      const originPattern = /^https?:\/\/[^\s/]+$/; // scheme + host[:port], no path/trailing slash — a real Origin header never has either
+      const invalid = origins.filter((origin) => !originPattern.test(origin));
+      if (invalid.length > 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `CORS_ALLOWED_ORIGINS contains invalid origin(s): ${invalid.join(', ')} — each must look like "https://example.com" or "http://localhost:3000" (no path, no trailing slash)`,
+        });
+        return z.NEVER;
+      }
+      return origins;
+    }),
 
   // The ONLY way to get the reflect-any-origin convenience behavior (for a
   // local frontend running on an arbitrary port) without an explicit
@@ -104,10 +147,10 @@ const envSchema = z.object({
   RATE_LIMIT_STANDARD_MAX: z.coerce.number().int().positive().default(100),
 
   // Backstop cap on oauthHandoff.service.ts's in-memory store (on top of its
-  // TTL-based purge) — see that file for the full reasoning. Configurable,
-  // and defaulted high (5000, not the original 1000), specifically so a
-  // realistic burst of legitimate logins can't evict a genuine not-yet-
-  // exchanged handoff before its own ~60s TTL naturally expires it.
+  // TTL-based purge) — see that file for the full reasoning. Hitting it
+  // rejects the NEW handoff (a 503, retryable) rather than evicting an
+  // existing, still-pending one — defaulted high (5000) specifically so a
+  // realistic burst of legitimate logins essentially never reaches it.
   OAUTH_HANDOFF_MAX_ENTRIES: z.coerce.number().int().positive().default(5000),
 
   // Account-level login lockout (auth.service.ts) — a self-clearing

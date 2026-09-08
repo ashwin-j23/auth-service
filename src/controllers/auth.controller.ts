@@ -19,9 +19,7 @@ const OAUTH_STATE_COOKIE = 'oauth_state';
 // with, or the browser may simply keep the original cookie around instead of
 // overwriting it. An earlier version set this cookie with
 // { httpOnly, secure, sameSite, signed, maxAge } but cleared it with no
-// options at all — functionally harmless for the *current* request (the
-// state value used for validation is read into a variable before clearing
-// either way), but it meant the cookie could survive in the browser past
+// options at all, which could leave the cookie sitting in the browser past
 // this callback, available to be reused in a way it was never meant to be.
 const OAUTH_STATE_COOKIE_OPTIONS = {
   httpOnly: true,
@@ -29,6 +27,28 @@ const OAUTH_STATE_COOKIE_OPTIONS = {
   sameSite: 'lax' as const,
   signed: true,
 };
+
+/**
+ * Checks the `code`/`state` query params against the signed state cookie.
+ * Pure — no response mutation here on purpose (see googleCallback): a CSRF
+ * state token should be validated *before* it's consumed/cleared, the same
+ * "burn after a single successful use" pattern as a refresh token (§9) or a
+ * handoff code (oauthHandoff.service.ts) — not cleared as an incidental
+ * first step regardless of whether this request turns out to be legitimate.
+ * Throws AppError(400) for anything invalid; returns the validated `code`.
+ */
+function validateOAuthCallback(query: Request['query'], cookieState: unknown): string {
+  const { code, state } = query;
+  if (typeof code !== 'string') {
+    throw new AppError(400, 'Missing authorization code');
+  }
+  if (!state || !cookieState || state !== cookieState) {
+    // Mismatched/missing state means this callback wasn't initiated by us
+    // — classic OAuth CSRF, reject outright rather than exchange the code.
+    throw new AppError(400, 'Invalid or missing OAuth state');
+  }
+  return code;
+}
 
 export async function signup(req: Request, res: Response, next: NextFunction) {
   try {
@@ -111,22 +131,20 @@ export function googleRedirect(_req: Request, res: Response) {
 /** GET /auth/google/callback — Google redirects here with `code` + `state`. */
 export async function googleCallback(req: Request, res: Response, next: NextFunction) {
   try {
-    const { code, state } = req.query;
     const cookieState = req.signedCookies?.[OAUTH_STATE_COOKIE];
-    // Cleared with the SAME options it was set with (see the constant's own
-    // comment above) — the state value needed for validation below was
-    // already captured into `cookieState` above, so clearing here doesn't
-    // affect this request's own validation either way; it's purely about
-    // making sure the cookie doesn't linger in the browser afterward.
-    res.clearCookie(OAUTH_STATE_COOKIE, OAUTH_STATE_COOKIE_OPTIONS);
-
-    if (typeof code !== 'string') {
-      throw new AppError(400, 'Missing authorization code');
-    }
-    if (!state || !cookieState || state !== cookieState) {
-      // Mismatched/missing state means this callback wasn't initiated by us
-      // — classic OAuth CSRF, reject outright rather than exchange the code.
-      throw new AppError(400, 'Invalid or missing OAuth state');
+    // Validate FIRST, clear second — not the other way around. Clearing is a
+    // response mutation; performing it before the request has even been
+    // checked means an invalid/forged callback still gets to consume (and
+    // therefore invalidate) the real, legitimate state cookie for whatever
+    // OAuth attempt is actually still in flight in this browser. Wrapping
+    // just the validation in its own try/finally keeps the clear tied to
+    // "we attempted to consume this state" without smearing it earlier than
+    // that across the function.
+    let code: string;
+    try {
+      code = validateOAuthCallback(req.query, cookieState);
+    } finally {
+      res.clearCookie(OAUTH_STATE_COOKIE, OAUTH_STATE_COOKIE_OPTIONS);
     }
 
     const { user, tokens } = await googleService.loginWithGoogleCode(code);

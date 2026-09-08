@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import { env } from '../config/env';
+import { AppError } from '../utils/AppError';
 import type { PublicUser } from '../utils/publicUser';
 import type { TokenPair } from './token.service';
 
@@ -37,35 +38,48 @@ function purgeExpired(): void {
   }
 }
 
-/** Stashes a login result behind a fresh opaque code and returns that code. */
+/**
+ * Stashes a login result behind a fresh opaque code and returns that code.
+ * Throws AppError(503) if the store is at capacity even after purging
+ * expired entries — see the comment below for why this rejects the new
+ * entry rather than evicting an old one.
+ */
 export function createHandoff(user: PublicUser, tokens: TokenPair): string {
   purgeExpired();
   if (store.size >= env.OAUTH_HANDOFF_MAX_ENTRIES) {
-    // Still over the cap after purging expired entries — evict the oldest
-    // one (Map iterates in insertion order, so the first key is the oldest
-    // surviving entry) rather than let this grow without bound.
+    // Deliberately fails THIS request rather than evicting an existing
+    // entry to make room. An earlier version evicted the oldest entry
+    // (Map's insertion order made that the one closest to its own natural
+    // expiry) — a reasonable-sounding "least harm" choice, but still a real
+    // one: that entry belongs to a *different* person who already
+    // completed a real Google login and simply hasn't finished the final
+    // exchange step yet. Evicting it fails their login for a reason that
+    // has nothing to do with anything they did — a confusing, silent,
+    // unattributable failure for an innocent bystander.
     //
-    // This is a real tradeoff, not a free backstop: the entry being evicted
-    // here hasn't expired yet — it belongs to someone who logged in
-    // recently and hasn't finished exchanging their code. Evicting it means
-    // that person's login will fail with "invalid or expired code" even
-    // though nothing was actually wrong with their flow. OAUTH_HANDOFF_MAX_ENTRIES
-    // defaults to 5000 specifically to make this vanishingly unlikely under
-    // realistic traffic — hitting it means 5000 *real, successful* Google
-    // logins landed within the same ~60s TTL window without being
-    // exchanged, which requires actual valid Google accounts completing
-    // actual OAuth consent screens, not something trivially scriptable.
-    // Logged rather than silently swallowed, since it's exactly the kind of
-    // thing that should page someone rather than just quietly cost one
-    // unlucky user a failed login.
-    const oldestKey = store.keys().next().value;
-    if (oldestKey !== undefined) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        `oauthHandoff: evicting an unexpired handoff entry — store hit its ${env.OAUTH_HANDOFF_MAX_ENTRIES}-entry cap. A legitimate pending login may fail.`,
-      );
-      store.delete(oldestKey);
-    }
+    // Rejecting the new request instead means the failure lands on the one
+    // login attempt that's actually causing the overload, right now, with
+    // an error the caller can act on (retry — a completely normal recovery
+    // path for a transient "please try again"), instead of reaching
+    // backward to break someone else's already-succeeding flow. This is
+    // the standard trade-off for any bounded resource under pressure: fail
+    // fast on the request that has a reasonable fallback (retry), rather
+    // than silently discarding state that a *different* caller has no way
+    // to know was ever at risk.
+    //
+    // OAUTH_HANDOFF_MAX_ENTRIES defaults to 5000 specifically to make
+    // hitting this vanishingly unlikely under realistic traffic — it means
+    // 5000 real, successful Google logins landed within the same ~60s TTL
+    // window without being exchanged, which requires actual valid Google
+    // accounts completing actual consent screens, not something trivially
+    // scriptable at volume. Logged as an error (not silently thrown) since
+    // reaching it at all is exactly the kind of thing that should page
+    // someone.
+    // eslint-disable-next-line no-console
+    console.error(
+      `oauthHandoff: store is full (${env.OAUTH_HANDOFF_MAX_ENTRIES} entries) — rejecting a new handoff rather than evicting someone else's pending login.`,
+    );
+    throw new AppError(503, 'Too many sign-ins in progress right now — please try again');
   }
   const code = crypto.randomBytes(24).toString('hex');
   store.set(code, { user, tokens, expiresAt: Date.now() + HANDOFF_TTL_MS });

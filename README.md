@@ -49,12 +49,13 @@ Unit tests never touch a real database — Prisma is replaced with a deep mock
 (`tests/mocks/prisma.mock.ts`), so they run instantly and deterministically.
 See EXPLANATION.md for how the mocking works and what each test covers.
 
-This has actually been run, not just written: 100 tests passing, `tsc --noEmit`
+This has actually been run, not just written: 114 tests passing, `tsc --noEmit`
 clean, and the full HTTP flow (signup/login/refresh rotation/reuse-detection/
 Google redirect/CORS behavior/trust-proxy/body-size-limit/graceful shutdown/
-account lockout/disabled-account handling/Unicode email normalization)
-exercised against a real Postgres instance — see the session transcript
-linked in the commits if you want the raw output.
+account lockout/disabled-account handling/Unicode email normalization/
+OAuth-handoff backpressure/malformed-CORS-config rejection) exercised against
+a real Postgres instance — see the session transcript linked in the commits
+if you want the raw output.
 
 ## API
 
@@ -144,8 +145,14 @@ about before shipping this as-is:
   against the current fully-stateless design, deferred until immediate
   token revocation is an actual requirement.
 - **`OAUTH_HANDOFF_MAX_ENTRIES` (default 5000) is a memory bound, not a
-  free one** — hitting it evicts an unexpired, not-yet-exchanged handoff,
-  which would fail that one user's in-progress login. Sized high enough
-  that only a genuinely abnormal volume of concurrent, unexchanged Google
-  logins would ever reach it; a warning is logged if it does, so it's
-  observable rather than a silent, confusing one-off failure.
+  free one** — hitting it rejects the *new* handoff (`503`, retryable)
+  rather than evicting an existing, still-pending one, so a spike never
+  silently breaks a *different* user's already-succeeding login. Sized high
+  enough that only a genuinely abnormal volume of concurrent, unexchanged
+  Google logins would ever reach it; logged as an error when it does, so
+  it's observable rather than a silent, confusing one-off failure.
+- **`CORS_ALLOWED_ORIGINS` is validated at boot**, not just split on commas
+  — each origin must look like `https://example.com` (scheme + host[:port],
+  no path, no trailing slash — a real browser `Origin` header never has
+  either), and an empty/comma-only value is rejected outright rather than
+  silently producing a broken allowlist that would never match anything.
