@@ -81,10 +81,14 @@ describe('token.service', () => {
       );
     });
 
-    it('rotates a valid token: revokes the old one and issues a new pair', async () => {
+    it('rotates a valid token: claims it atomically and issues a new pair', async () => {
       const stored = fakeStoredRefreshToken();
       prismaMock.refreshToken.findUnique.mockResolvedValue(stored);
-      prismaMock.$transaction.mockResolvedValue([{}, {}]);
+      // Interactive transaction — invoke the callback with prismaMock itself
+      // standing in for `tx` (it's already a deep mock of every Prisma method).
+      prismaMock.$transaction.mockImplementation((cb: any) => cb(prismaMock));
+      prismaMock.refreshToken.updateMany.mockResolvedValue({ count: 1 }); // won the claim
+      prismaMock.refreshToken.create.mockResolvedValue(fakeStoredRefreshToken());
 
       const pair = await rotateRefreshToken('valid-raw-token');
 
@@ -93,7 +97,33 @@ describe('token.service', () => {
         email: fakeUser.email,
       });
       expect(pair.refreshToken).not.toBe('valid-raw-token');
-      expect(prismaMock.$transaction).toHaveBeenCalledTimes(1);
+      expect(prismaMock.refreshToken.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: { id: stored.id, revokedAt: null } }),
+      );
+      expect(prismaMock.refreshToken.create).toHaveBeenCalledTimes(1);
+    });
+
+    it('closes the rotation race: a lost claim (count 0) is treated as reuse, not a hard error', async () => {
+      // Simulates two concurrent rotate calls for the same token: this call's
+      // findUnique still sees revokedAt: null (the other caller hasn't
+      // committed yet), but by the time its own conditional updateMany runs,
+      // the other caller already claimed the row — count comes back 0.
+      const stored = fakeStoredRefreshToken();
+      prismaMock.refreshToken.findUnique.mockResolvedValue(stored);
+      prismaMock.$transaction.mockImplementation((cb: any) => cb(prismaMock));
+      prismaMock.refreshToken.updateMany
+        .mockResolvedValueOnce({ count: 0 }) // lost the claim, inside the transaction
+        .mockResolvedValueOnce({ count: 1 }); // the subsequent mass-revoke-for-user call
+
+      await expect(rotateRefreshToken('raced-token')).rejects.toThrow(
+        'Refresh token has already been used',
+      );
+      expect(prismaMock.refreshToken.create).not.toHaveBeenCalled();
+      // Second updateMany call is the mass revoke, same as the "already
+      // revoked" branch — same fallback response to a detected race/replay.
+      expect(prismaMock.refreshToken.updateMany).toHaveBeenLastCalledWith(
+        expect.objectContaining({ where: { userId: fakeUser.id, revokedAt: null } }),
+      );
     });
   });
 

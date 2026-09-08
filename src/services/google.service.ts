@@ -2,6 +2,7 @@ import { OAuth2Client } from 'google-auth-library';
 import { prisma } from '../lib/prisma';
 import { env } from '../config/env';
 import { AppError } from '../utils/AppError';
+import { normalizeEmail } from '../utils/email';
 import { issueTokenPair, type TokenPair } from './token.service';
 import { toPublicUser, type PublicUser } from '../utils/publicUser';
 
@@ -58,7 +59,11 @@ export async function exchangeCodeForProfile(code: string): Promise<GoogleProfil
 
   return {
     googleId: payload.sub,
-    email: payload.email.trim().toLowerCase(),
+    // Reuses the exact same normalization signup/login use (src/utils/email.ts)
+    // rather than reimplementing trim+lowercase here — two independent
+    // "canonical email" implementations drifting apart is exactly what would
+    // make the email-based account-linking lookup below miss a real match.
+    email: normalizeEmail(payload.email),
     emailVerified: payload.email_verified ?? false,
     name: payload.name ?? null,
   };
@@ -72,18 +77,27 @@ export async function exchangeCodeForProfile(code: string): Promise<GoogleProfil
  *    link it, but only if Google has verified the email, so an attacker
  *    can't hijack an existing account via an unverified email address
  *  - otherwise -> create a brand-new, password-less account
+ *
+ * A single query checks both `googleId` and `email` (rather than two
+ * sequential round trips) since at most one of them can realistically match
+ * under normal operation — both columns are unique, and a user's googleId is
+ * only ever set together with (or onto) the row for their one email.
  */
 export async function findOrCreateGoogleUser(profile: GoogleProfile) {
-  const byGoogleId = await prisma.user.findUnique({ where: { googleId: profile.googleId } });
-  if (byGoogleId) return byGoogleId;
+  const existing = await prisma.user.findFirst({
+    where: { OR: [{ googleId: profile.googleId }, { email: profile.email }] },
+  });
 
-  const byEmail = await prisma.user.findUnique({ where: { email: profile.email } });
-  if (byEmail) {
+  if (existing?.googleId === profile.googleId) {
+    return existing;
+  }
+
+  if (existing) {
     if (!profile.emailVerified) {
       throw new AppError(400, 'Google account email is not verified');
     }
     return prisma.user.update({
-      where: { id: byEmail.id },
+      where: { id: existing.id },
       data: { googleId: profile.googleId, isEmailVerified: true },
     });
   }

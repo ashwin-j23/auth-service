@@ -45,6 +45,19 @@ export async function issueTokenPair(user: User): Promise<TokenPair> {
 }
 
 /**
+ * Revokes every currently-active refresh token for a user. Called when a
+ * used-and-revoked token is replayed — the standard response to a suspected
+ * theft signal, since we can't tell "attacker replaying a stolen token" from
+ * "legit client retried a request" any other way.
+ */
+async function revokeAllTokensForUser(userId: string): Promise<void> {
+  await prisma.refreshToken.updateMany({
+    where: { userId, revokedAt: null },
+    data: { revokedAt: new Date() },
+  });
+}
+
+/**
  * Exchanges a still-valid refresh token for a new token pair, revoking the
  * old one in the same operation (rotation) so each refresh token can only
  * ever be used once. Throws AppError(401) for anything not usable.
@@ -60,12 +73,7 @@ export async function rotateRefreshToken(rawRefreshToken: string): Promise<Token
     throw new AppError(401, 'Invalid refresh token');
   }
   if (stored.revokedAt) {
-    // Reuse of an already-rotated/revoked token is a signal the token was
-    // stolen — revoke every other active token for this user as a precaution.
-    await prisma.refreshToken.updateMany({
-      where: { userId: stored.userId, revokedAt: null },
-      data: { revokedAt: new Date() },
-    });
+    await revokeAllTokensForUser(stored.userId);
     throw new AppError(401, 'Refresh token has already been used');
   }
   if (stored.expiresAt < new Date()) {
@@ -75,19 +83,42 @@ export async function rotateRefreshToken(rawRefreshToken: string): Promise<Token
   const newRawRefreshToken = generateRawRefreshToken();
   const newTokenHash = hashToken(newRawRefreshToken);
 
-  await prisma.$transaction([
-    prisma.refreshToken.update({
-      where: { id: stored.id },
+  // Two concurrent calls can both reach this point holding the same
+  // still-unrevoked `stored` row (read above), racing to rotate it — a
+  // stolen-but-still-valid token replayed at the same moment a legitimate
+  // client refreshes, for instance. An unconditional update here would let
+  // both callers "win" and each walk away with a valid new token from one
+  // old one, silently defeating the single-use guarantee.
+  //
+  // Guard against that with a conditional update — `revokedAt: null` in the
+  // WHERE clause is re-checked against the row's *current* state at write
+  // time, not the state read above, and Postgres serializes concurrent
+  // UPDATEs to the same row: the second writer's WHERE clause sees the first
+  // writer's committed change and matches zero rows. `count === 0` here
+  // means this call lost that race, not that anything is wrong with the
+  // token itself.
+  const rotated = await prisma.$transaction(async (tx) => {
+    const claim = await tx.refreshToken.updateMany({
+      where: { id: stored.id, revokedAt: null },
       data: { revokedAt: new Date(), replacedByTokenHash: newTokenHash },
-    }),
-    prisma.refreshToken.create({
+    });
+    if (claim.count === 0) {
+      return false;
+    }
+    await tx.refreshToken.create({
       data: {
         tokenHash: newTokenHash,
         userId: stored.userId,
         expiresAt: refreshTokenExpiry(),
       },
-    }),
-  ]);
+    });
+    return true;
+  });
+
+  if (!rotated) {
+    await revokeAllTokensForUser(stored.userId);
+    throw new AppError(401, 'Refresh token has already been used');
+  }
 
   const accessToken = signAccessToken({ sub: stored.user.id, email: stored.user.email });
   return { accessToken, refreshToken: newRawRefreshToken };

@@ -1,4 +1,4 @@
-import type { User } from '@prisma/client';
+import { Prisma, type User } from '@prisma/client';
 import { prismaMock } from '../mocks/prisma.mock';
 import { signup, login } from '../../src/services/auth.service';
 import { hashPassword } from '../../src/utils/password';
@@ -66,6 +66,33 @@ describe('auth.service', () => {
         accessToken: 'fake-access-token',
         refreshToken: 'fake-refresh-token',
       });
+    });
+
+    it('closes the signup race: a duplicate caught only by the DB constraint still gets a clean 409', async () => {
+      // Simulates two concurrent signups for the same email: this call's
+      // findUnique still sees no existing row (the other caller hasn't
+      // committed yet), so it proceeds to create() — which is where Postgres's
+      // real unique constraint on `email` catches it.
+      prismaMock.user.findUnique.mockResolvedValue(null);
+      prismaMock.user.create.mockRejectedValue(
+        new Prisma.PrismaClientKnownRequestError('Unique constraint failed on the fields: (`email`)', {
+          code: 'P2002',
+          clientVersion: '5.22.0',
+        }),
+      );
+
+      await expect(
+        signup({ email: 'jane@example.com', password: 'password123' }),
+      ).rejects.toMatchObject(new AppError(409, 'An account with this email already exists'));
+    });
+
+    it('re-throws an unrelated database error rather than misreporting it as a duplicate', async () => {
+      prismaMock.user.findUnique.mockResolvedValue(null);
+      prismaMock.user.create.mockRejectedValue(new Error('connection reset'));
+
+      await expect(
+        signup({ email: 'jane@example.com', password: 'password123' }),
+      ).rejects.toThrow('connection reset');
     });
   });
 

@@ -1,7 +1,9 @@
 import request from 'supertest';
-import type { User } from '@prisma/client';
+import { Prisma, type User } from '@prisma/client';
 import { prismaMock } from '../mocks/prisma.mock';
 import { createApp } from '../../src/app';
+import { createHandoff } from '../../src/services/oauthHandoff.service';
+import { toPublicUser } from '../../src/utils/publicUser';
 
 const app = createApp();
 
@@ -64,6 +66,30 @@ describe('POST /api/auth/signup', () => {
 
     expect(res.status).toBe(409);
   });
+
+  it('returns 409 (not 500) when the race is only caught by the DB unique constraint', async () => {
+    prismaMock.user.findUnique.mockResolvedValue(null); // fast-path check misses the race
+    prismaMock.user.create.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError('Unique constraint failed on the fields: (`email`)', {
+        code: 'P2002',
+        clientVersion: '5.22.0',
+      }),
+    );
+
+    const res = await request(app)
+      .post('/api/auth/signup')
+      .send({ email: 'jane@example.com', password: 'password123' });
+
+    expect(res.status).toBe(409);
+  });
+
+  it('rejects a password over 72 characters with 400', async () => {
+    const res = await request(app)
+      .post('/api/auth/signup')
+      .send({ email: 'jane@example.com', password: 'a'.repeat(73) });
+
+    expect(res.status).toBe(400);
+  });
 });
 
 describe('POST /api/auth/login', () => {
@@ -92,6 +118,31 @@ describe('GET /api/auth/google', () => {
     expect(res.status).toBe(302);
     expect(res.headers.location).toContain('accounts.google.com');
     expect(res.headers['set-cookie']?.[0]).toMatch(/oauth_state=/);
+  });
+});
+
+describe('POST /api/auth/google/exchange', () => {
+  it('rejects an unknown code with 400', async () => {
+    const res = await request(app)
+      .post('/api/auth/google/exchange')
+      .send({ code: 'not-a-real-handoff-code' });
+
+    expect(res.status).toBe(400);
+  });
+
+  it('exchanges a valid handoff code exactly once', async () => {
+    const user = toPublicUser(buildUser({ email: 'oauth-user@example.com' }));
+    const tokens = { accessToken: 'atk', refreshToken: 'rtk' };
+    const code = createHandoff(user, tokens);
+
+    const first = await request(app).post('/api/auth/google/exchange').send({ code });
+    expect(first.status).toBe(200);
+    expect(first.body.user.email).toBe('oauth-user@example.com');
+    expect(first.body.tokens).toEqual(tokens);
+
+    // Single-use: the same code can't be exchanged twice.
+    const second = await request(app).post('/api/auth/google/exchange').send({ code });
+    expect(second.status).toBe(400);
   });
 });
 

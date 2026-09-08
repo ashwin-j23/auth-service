@@ -4,6 +4,7 @@ import { env } from '../config/env';
 import * as authService from '../services/auth.service';
 import * as googleService from '../services/google.service';
 import * as tokenService from '../services/token.service';
+import { createHandoff, consumeHandoff } from '../services/oauthHandoff.service';
 import { AppError } from '../utils/AppError';
 import type { AuthenticatedRequest } from '../middleware/auth.middleware';
 import { prisma } from '../lib/prisma';
@@ -95,12 +96,36 @@ export async function googleCallback(req: Request, res: Response, next: NextFunc
       throw new AppError(400, 'Invalid or missing OAuth state');
     }
 
-    const { tokens } = await googleService.loginWithGoogleCode(code);
+    const { user, tokens } = await googleService.loginWithGoogleCode(code);
+
+    // Tokens are deliberately NOT put in this redirect URL: a URL can end up
+    // in browser history, the frontend's own server access logs, or a
+    // Referer header sent to any third-party resource the landing page
+    // loads. Instead, hand the browser a short-lived, single-use handoff
+    // code and let the frontend immediately exchange it for the real tokens
+    // via POST /auth/google/exchange (see oauthHandoff.service.ts).
+    const handoffCode = createHandoff(user, tokens);
 
     const redirectUrl = new URL(env.OAUTH_SUCCESS_REDIRECT_URL);
-    redirectUrl.searchParams.set('accessToken', tokens.accessToken);
-    redirectUrl.searchParams.set('refreshToken', tokens.refreshToken);
+    redirectUrl.searchParams.set('code', handoffCode);
     res.redirect(redirectUrl.toString());
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /auth/google/exchange — the frontend calls this immediately after
+ * being redirected back from googleCallback, trading the short-lived
+ * handoff `code` in the URL for the actual user + tokens.
+ */
+export async function googleExchange(req: Request, res: Response, next: NextFunction) {
+  try {
+    const result = consumeHandoff(req.body.code);
+    if (!result) {
+      throw new AppError(400, 'Invalid, expired, or already-used exchange code');
+    }
+    res.status(200).json(result);
   } catch (err) {
     next(err);
   }

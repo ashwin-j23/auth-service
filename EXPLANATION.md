@@ -151,13 +151,20 @@ const envSchema = z.object({
   PORT: z.coerce.number().int().positive().default(4000),
   DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
   JWT_ACCESS_SECRET: z.string().min(16, 'JWT_ACCESS_SECRET must be at least 16 characters'),
-  JWT_ACCESS_TTL: z.string().default('15m'),
+  JWT_ACCESS_TTL: z
+    .string()
+    .regex(
+      /^\d+$|^\d+(\.\d+)?\s?(ms|s|m|h|d|w|y)$/,
+      'JWT_ACCESS_TTL must be a number of seconds, or a value like "15m", "1h", "7d"',
+    )
+    .default('15m'),
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(7),
   COOKIE_SECRET: z.string().min(16, 'COOKIE_SECRET must be at least 16 characters'),
   GOOGLE_CLIENT_ID: z.string().min(1, 'GOOGLE_CLIENT_ID is required'),
   GOOGLE_CLIENT_SECRET: z.string().min(1, 'GOOGLE_CLIENT_SECRET is required'),
   GOOGLE_REDIRECT_URI: z.string().url(),
   OAUTH_SUCCESS_REDIRECT_URL: z.string().url(),
+  CORS_ALLOWED_ORIGINS: z.string().optional(),
 });
 
 export const env = envSchema.parse(process.env);
@@ -173,6 +180,22 @@ export const env = envSchema.parse(process.env);
 - `.min(16, '...')` on both secrets — a cheap guard against someone leaving
   the placeholder `"changeme"` in production; not a real strength check, but
   catches the most common mistake.
+- `JWT_ACCESS_TTL`'s `.regex(...)` — this one is worth dwelling on, because
+  it's fixing a real gap: `src/utils/jwt.ts` passes this value straight into
+  `jwt.sign()`'s `expiresIn` option and comments that it's "validated at
+  startup to be jwt.sign-compatible" — but until this regex was added, the
+  schema was just `z.string()`, which accepts *any* string, including ones
+  `jwt.sign` would reject at call time. That made the comment false: an
+  operator setting `JWT_ACCESS_TTL=banana` would sail through
+  `envSchema.parse()` at boot, and only find out something was wrong when
+  the very first signup/login call threw deep inside `jsonwebtoken`. The
+  regex (accepting either a bare number of seconds, or a number plus a
+  short unit like `15m`/`1h`/`7d`) makes the two actually agree — an invalid
+  value now fails at the same `envSchema.parse()` call as every other
+  misconfiguration.
+- `CORS_ALLOWED_ORIGINS` is `.optional()` on purpose (see `app.ts`, §18) —
+  its *absence* means something different depending on `NODE_ENV`, so it
+  can't just have a hardcoded default here.
 - `envSchema.parse(process.env)` — **throws immediately** if anything is
   missing or malformed. This means a missing `GOOGLE_CLIENT_SECRET` crashes
   the app the instant it starts (with a clear zod error naming the field),
@@ -424,11 +447,21 @@ generic, so it doesn't help an attacker distinguish "wrong token" from
 "right token, wrong state").
 
 ```ts
+async function revokeAllTokensForUser(userId: string): Promise<void> {
+  await prisma.refreshToken.updateMany({
+    where: { userId, revokedAt: null },
+    data: { revokedAt: new Date() },
+  });
+}
+```
+A small extracted helper — "revoke every active token this user has" — used
+in two places below for the same reason both times: a detected reuse/replay
+of a refresh token. Pulled out once rather than duplicated so that reason
+only has to be explained (and, if it ever changes, fixed) in one place.
+
+```ts
   if (stored.revokedAt) {
-    await prisma.refreshToken.updateMany({
-      where: { userId: stored.userId, revokedAt: null },
-      data: { revokedAt: new Date() },
-    });
+    await revokeAllTokensForUser(stored.userId);
     throw new AppError(401, 'Refresh token has already been used');
   }
 ```
@@ -464,29 +497,80 @@ just old).
   const newRawRefreshToken = generateRawRefreshToken();
   const newTokenHash = hashToken(newRawRefreshToken);
 
-  await prisma.$transaction([
-    prisma.refreshToken.update({
-      where: { id: stored.id },
+  const rotated = await prisma.$transaction(async (tx) => {
+    const claim = await tx.refreshToken.updateMany({
+      where: { id: stored.id, revokedAt: null },
       data: { revokedAt: new Date(), replacedByTokenHash: newTokenHash },
-    }),
-    prisma.refreshToken.create({
+    });
+    if (claim.count === 0) {
+      return false;
+    }
+    await tx.refreshToken.create({
       data: {
         tokenHash: newTokenHash,
         userId: stored.userId,
         expiresAt: refreshTokenExpiry(),
       },
-    }),
-  ]);
+    });
+    return true;
+  });
+
+  if (!rotated) {
+    await revokeAllTokensForUser(stored.userId);
+    throw new AppError(401, 'Refresh token has already been used');
+  }
 
   const accessToken = signAccessToken({ sub: stored.user.id, email: stored.user.email });
   return { accessToken, refreshToken: newRawRefreshToken };
 }
 ```
-The actual rotation: revoke the old row, insert a new one, **in a single
-Postgres transaction** (`prisma.$transaction([...])`) so it's impossible for
-the database to end up in a state where the old token is revoked but the new
-one never got created (or vice versa) — e.g. if the process crashed
-mid-operation. Then sign a fresh access token and hand back the new pair.
+This is the trickiest part of the whole codebase, and worth being precise
+about — an earlier version of this function had a real race condition here,
+found in code review, that's worth understanding even though it's fixed now.
+
+**The bug it replaced.** The earlier version, after the two checks above,
+just ran an unconditional `update` (by `stored.id`) to revoke the old row
+and an `insert` for the new one, in a transaction. That transaction keeps
+the *database* consistent (never "revoked but no replacement exists"), but
+it does nothing about a **read-then-write race between two concurrent calls
+to this function**. Picture a stolen refresh token being replayed by an
+attacker at almost the exact moment the legitimate user's client refreshes
+normally: both calls run their `findUnique` (the read, earlier in this
+function) before either has written anything, so *both* see
+`revokedAt: null` and *both* pass the reuse check above. Both then proceed
+to the old unconditional `update` — and since neither write was
+*conditioned* on what the other one did, both succeed, each producing its
+own valid new refresh token from the same old one. That's exactly the
+single-use guarantee this whole function exists to provide, silently broken.
+
+**The fix.** `tx.refreshToken.updateMany({ where: { id: stored.id, revokedAt: null }, ... })`
+looks redundant with the `if (stored.revokedAt)` check above — same
+condition, checked twice — but it isn't, because it's checked at a
+*different time* and in a *different place*. The `if` check above reads
+`stored`, an in-memory snapshot taken at the *start* of this function. This
+`updateMany`'s `WHERE revokedAt: null` is evaluated by Postgres against the
+row's *actual, current* state at the moment of the write — and Postgres
+serializes concurrent writers to the same row (the second writer's `UPDATE`
+blocks until the first commits, then re-evaluates its `WHERE` clause against
+the now-committed data). So in the race above: both calls' reads see
+`revokedAt: null`, both pass the `if` check, both reach this `updateMany` —
+but only the *first* one to actually execute the write finds a row where
+`revokedAt` is still `null` and updates it (`claim.count === 1`); the
+second one's `WHERE` clause, evaluated after the first's write committed,
+now matches zero rows (`claim.count === 0`). This pattern — a conditional
+update whose `WHERE` re-checks the state you're relying on, rather than an
+unconditional write following an earlier read — is the standard way to
+implement compare-and-swap against a database row, and it's what actually
+closes the race, not the transaction wrapping it (the transaction's job is
+narrower: making the claim-then-insert pair atomic, so a crash between them
+can't leave a revoked token with no replacement).
+
+`claim.count === 0` is treated exactly like the "already revoked" branch
+above (`revokeAllTokensForUser` + the same `401`) — from the caller's
+perspective, losing this race looks identical to replaying an already-used
+token, because functionally, in the scenario that makes this race possible
+at all (a stolen token replayed concurrently with legitimate use), that's
+exactly what happened.
 
 ```ts
 export async function revokeRefreshToken(rawRefreshToken: string): Promise<void> {
@@ -508,13 +592,21 @@ never be treated as a failure from the client's perspective.
 ## 10. `src/services/auth.service.ts` — signup and login
 
 ```ts
-function normalizeEmail(email: string): string {
+// src/utils/email.ts — shared by this file AND google.service.ts
+export function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
 }
 ```
 `Jane@Example.com`, ` jane@example.com`, and `jane@example.com` should all be
 the *same* account. Normalizing before every lookup/insert means the `@unique`
 constraint on `email` in the schema actually behaves the way a user expects.
+This function lives in its own `src/utils/email.ts` (not duplicated locally)
+specifically because `google.service.ts` needs the exact same normalization —
+if the two files each implemented "trim + lowercase" independently, a future
+tweak to one (say, adding Unicode normalization for lookalike characters)
+applied to only one of them would make the two files disagree about what
+"the same email" means, and the Google-account-linking logic in
+`google.service.ts` (§11) depends entirely on that agreement to work.
 
 ```ts
 export async function signup(input: SignupInput): Promise<AuthResult> {
@@ -525,22 +617,58 @@ export async function signup(input: SignupInput): Promise<AuthResult> {
   }
 
   const passwordHash = await hashPassword(input.password);
-  const user = await prisma.user.create({
-    data: { email, passwordHash, name: input.name },
-  });
+
+  let user;
+  try {
+    user = await prisma.user.create({
+      data: { email, passwordHash, name: input.name },
+    });
+  } catch (err) {
+    if (
+      err instanceof Prisma.PrismaClientKnownRequestError &&
+      err.code === 'P2002'
+    ) {
+      throw new AppError(409, 'An account with this email already exists');
+    }
+    throw err;
+  }
 
   const tokens = await issueTokenPair(user);
   return { user: toPublicUser(user), tokens };
 }
 ```
-Five steps, in order: normalize → check for a duplicate (`409 Conflict` is
-the correct HTTP status for "this resource already exists") → hash the
-password (never `data: { password: input.password }`) → create the row →
-immediately issue tokens, so a freshly-signed-up user is logged in without a
-separate login call. Note the comment in the code explicitly justifying why
-this endpoint *is* specific about "email already exists" (unlike login,
-next) — it's a public signup form, so confirming an email is taken isn't a
-meaningful leak, and vague errors here would just be confusing.
+Normalize → check for a duplicate → hash the password (never
+`data: { password: input.password }`) → create the row → issue tokens, so a
+freshly-signed-up user is logged in without a separate login call. Note the
+comment in the code explicitly justifying why this endpoint *is* specific
+about "email already exists" (unlike login, next) — it's a public signup
+form, so confirming an email is taken isn't a meaningful leak, and a vague
+error here would just be confusing.
+
+The `try`/`catch` around `prisma.user.create` is closing a race that the
+`findUnique` check above **cannot** close by itself, no matter how it's
+written — this is worth understanding precisely, because it's a general
+shape of bug, not specific to this one function. Two signup requests for the
+same email, arriving close enough together: both run `findUnique` before
+either has written anything, so both see "no existing user" and both proceed
+to `create`. Only one `INSERT` can actually succeed — Postgres's own
+`@unique` constraint on `email` (`prisma/schema.prisma`, §2) is what
+actually prevents two rows with the same email from existing, and it does
+so correctly regardless of timing, because unlike the `findUnique` check
+(a read, followed later by a separate write, with an unguarded window
+between them) the constraint is enforced by the database *at the moment of
+the write itself*. The `findUnique` check is real and useful — it's what
+lets the *overwhelming majority* of duplicate-signup attempts fail fast with
+a clean `409` *without* paying the cost of hashing a password first — but
+it's a fast path, not the guarantee. Without the `try`/`catch`, the loser of
+that race would throw a raw `PrismaClientKnownRequestError` (Prisma's name
+for a known-shape database error; code `P2002` specifically means "unique
+constraint violated") that isn't an `AppError`, so `errorHandler` (§14)
+would fall through to its generic branch and answer with a `500` — true, but
+misleading: nothing is actually broken, the person just needs to log in
+instead. Catching `P2002` specifically (not catching *every* error here,
+which would risk mislabeling an unrelated database problem as "email taken")
+turns that into the same clean `409` the fast path returns.
 
 ```ts
 export async function login(input: LoginInput): Promise<AuthResult> {
@@ -638,7 +766,7 @@ export async function exchangeCodeForProfile(code: string): Promise<GoogleProfil
 
   return {
     googleId: payload.sub,
-    email: payload.email.trim().toLowerCase(),
+    email: normalizeEmail(payload.email),
     emailVerified: payload.email_verified ?? false,
     name: payload.name ?? null,
   };
@@ -659,19 +787,31 @@ the browser again after Google's redirect delivers it):
 - `payload.email_verified ?? false` — Google itself distinguishes verified
   vs. unverified emails (e.g., some enterprise/G Suite setups); default to
   the safe assumption (`false`) if the claim is somehow absent.
+- `normalizeEmail(...)` — imported from `src/utils/email.ts`, the exact same
+  function `auth.service.ts` uses (§10). Written out locally here as
+  `payload.email.trim().toLowerCase()` in an earlier version, which worked
+  identically *today* but meant two files independently encoded the same
+  rule — the kind of duplication that's easy to update in one place and
+  forget in the other. Reusing the one function means there's only one
+  definition of "the same email" for the account-linking lookup below to
+  ever disagree with.
 
 ```ts
 export async function findOrCreateGoogleUser(profile: GoogleProfile) {
-  const byGoogleId = await prisma.user.findUnique({ where: { googleId: profile.googleId } });
-  if (byGoogleId) return byGoogleId;
+  const existing = await prisma.user.findFirst({
+    where: { OR: [{ googleId: profile.googleId }, { email: profile.email }] },
+  });
 
-  const byEmail = await prisma.user.findUnique({ where: { email: profile.email } });
-  if (byEmail) {
+  if (existing?.googleId === profile.googleId) {
+    return existing;
+  }
+
+  if (existing) {
     if (!profile.emailVerified) {
       throw new AppError(400, 'Google account email is not verified');
     }
     return prisma.user.update({
-      where: { id: byEmail.id },
+      where: { id: existing.id },
       data: { googleId: profile.googleId, isEmailVerified: true },
     });
   }
@@ -687,21 +827,38 @@ export async function findOrCreateGoogleUser(profile: GoogleProfile) {
   });
 }
 ```
-Three cases, checked in order:
-1. **Already linked** — this exact Google account has logged in before →
-   return the existing user, nothing to write.
+Same three cases as before, but now found with **one** query instead of two
+sequential ones:
+1. **Already linked** — `existing.googleId === profile.googleId` — this
+   exact Google account has logged in before → return the existing user,
+   nothing to write.
 2. **Email matches an existing (e.g. password-based) account, not yet
-   linked to Google** — link them, *but only if `profile.emailVerified` is
-   true*. This `if` is the one line standing between this feature and a real
+   linked to Google** (`existing` is set, but its `googleId` isn't this
+   profile's) — link them, *but only if `profile.emailVerified` is true*.
+   This `if` is the one line standing between this feature and a real
    account-takeover vulnerability: without it, anyone who controls *any*
    Google account claiming to be `victim@example.com` (Google lets you
    create an account with an *unverified* alternate email in some flows)
    could "log in with Google" as that email and get silently linked to — and
    therefore able to log into — the victim's existing password account.
    Requiring Google's own verification closes that off.
-3. **No match at all** — brand new user, `passwordHash: null` (they can
-   never log in with a password — only Google — unless a "set a password"
-   feature is added later).
+3. **No match at all** (`existing` is `null`) — brand new user,
+   `passwordHash: null` (they can never log in with a password — only
+   Google — unless a "set a password" feature is added later).
+
+**Why one query is safe here, not just faster.** The earlier version ran
+`findUnique` by `googleId`, and only if that missed, a *second* `findUnique`
+by `email` — two round trips to Postgres on the hot path of every Google
+login, even though at most one of them could ever find anything on a normal
+account (both columns are `@unique`, and a user's `googleId` is only ever
+set together with, or onto, the row for their one `email` — see the schema,
+§2). Combining them into a single `findFirst` with an `OR` returns the same
+answer in one round trip in every realistic case. The one thing this
+collapsed query can't distinguish on its own is *which* branch of the `OR`
+matched, if you needed to know that in general — which is exactly why the
+code doesn't rely on knowing that; instead it re-derives it with
+`existing?.googleId === profile.googleId`, a check against the row Postgres
+actually returned, not an assumption about how it got matched.
 
 ```ts
 export async function loginWithGoogleCode(code: string): Promise<GoogleLoginResult> {
@@ -714,7 +871,102 @@ export async function loginWithGoogleCode(code: string): Promise<GoogleLoginResu
 Glues the three pieces together: verify with Google → find/create the local
 user → issue this app's own JWT/refresh token pair (from here on, this app
 never needs to talk to Google again for this session — it's a completely
-independent, self-issued token).
+independent, self-issued token). The caller — `googleCallback` in the
+controller, §12 — doesn't hand these tokens straight to the browser, though;
+see the handoff mechanism right below for why.
+
+---
+
+## 11a. `src/services/oauthHandoff.service.ts` — getting tokens past a redirect safely
+
+`googleCallback` (§12, next) is a `GET` route — Google itself redirects the
+browser there, so this app doesn't get to choose the HTTP method or send a
+JSON body back the way `signup`/`login`/`refresh` do. The only thing a
+server can hand back to a browser mid-redirect is another redirect, i.e. a
+URL. An earlier version of this code took the obvious-looking shortcut of
+putting the freshly-issued tokens directly into that URL's query string
+(`?accessToken=...&refreshToken=...`). That works, but a URL isn't a private
+channel the way a JSON response body is: it can end up preserved in the
+browser's history, logged by the frontend's own web server (URLs are
+routinely written to access logs; response bodies aren't), or sent onward in
+a `Referer` header to any third-party resource the landing page happens to
+load (an ad, an analytics script, a font). None of those are exotic
+attacks — they're just what URLs *do* by default — and the token being
+leaked this way is a long-lived refresh token, not a 15-minute access token.
+
+The fix follows the same shape OAuth itself already uses for the outer
+flow: Google doesn't hand back real credentials in its own redirect either —
+it hands back a short-lived, single-use authorization `code`, which the
+*backend* (not the browser) then exchanges, server-to-server, for the real
+thing. This file does the identical trick one layer further in: the backend
+hands the *browser* a short-lived, single-use handoff `code` instead of the
+tokens, and the frontend immediately exchanges that code — via a normal
+`POST` with a JSON body, not a URL — for the real tokens.
+
+```ts
+interface HandoffEntry {
+  user: PublicUser;
+  tokens: TokenPair;
+  expiresAt: number;
+}
+
+const HANDOFF_TTL_MS = 60 * 1000; // must be exchanged within 1 minute
+const store = new Map<string, HandoffEntry>();
+```
+The store itself is deliberately as simple as it can be: a plain in-memory
+`Map`, keyed by the handoff code, valued with whatever `googleCallback`
+already computed (the public user + token pair) plus an expiry timestamp.
+Living only in process memory is a real, named limitation (see
+`README.md`'s security notes) — it means a handoff created on one backend
+instance is invisible to a different instance, which matters the moment
+there's more than one process behind a load balancer. It's the right choice
+*for this project's stated scope* (a single backend instance) precisely
+because it adds no new infrastructure dependency; swapping it for Redis or a
+short-lived database row later is a contained change, since every other file
+only ever calls `createHandoff`/`consumeHandoff`, never touches `store`
+directly.
+
+```ts
+function purgeExpired(): void {
+  const now = Date.now();
+  for (const [code, entry] of store) {
+    if (entry.expiresAt < now) store.delete(code);
+  }
+}
+
+export function createHandoff(user: PublicUser, tokens: TokenPair): string {
+  purgeExpired();
+  const code = crypto.randomBytes(24).toString('hex');
+  store.set(code, { user, tokens, expiresAt: Date.now() + HANDOFF_TTL_MS });
+  return code;
+}
+```
+`purgeExpired()` runs on every `createHandoff` call rather than on a timer —
+simple, and sufficient: since a real OAuth login is the only thing that ever
+calls this, the store can only ever accumulate entries roughly as fast as
+people log in, and each login opportunistically sweeps out anything stale.
+`crypto.randomBytes(24)` — the same cryptographically-secure random source
+used for refresh tokens (`token.service.ts`, §9) — generates the code
+itself; guessing a valid one is infeasible for the same reason guessing a
+refresh token is.
+
+```ts
+export function consumeHandoff(code: string): { user: PublicUser; tokens: TokenPair } | undefined {
+  const entry = store.get(code);
+  store.delete(code);
+  if (!entry || entry.expiresAt < Date.now()) {
+    return undefined;
+  }
+  return { user: entry.user, tokens: entry.tokens };
+}
+```
+`store.delete(code)` runs **unconditionally**, before the expiry check —
+this is what makes the code single-use even in the failure case. If it only
+deleted on the success path, a client that raced to exchange an
+already-expired-but-not-yet-purged code could, depending on timing, still
+find it present; deleting first and validating after means a code is
+consumed by the *first* call that looks it up, full stop, whether that call
+succeeds or not.
 
 ---
 
@@ -811,11 +1063,12 @@ export async function googleCallback(req: Request, res: Response, next: NextFunc
       throw new AppError(400, 'Invalid or missing OAuth state');
     }
 
-    const { tokens } = await googleService.loginWithGoogleCode(code);
+    const { user, tokens } = await googleService.loginWithGoogleCode(code);
+
+    const handoffCode = createHandoff(user, tokens);
 
     const redirectUrl = new URL(env.OAUTH_SUCCESS_REDIRECT_URL);
-    redirectUrl.searchParams.set('accessToken', tokens.accessToken);
-    redirectUrl.searchParams.set('refreshToken', tokens.refreshToken);
+    redirectUrl.searchParams.set('code', handoffCode);
     res.redirect(redirectUrl.toString());
   } catch (err) {
     next(err);
@@ -823,7 +1076,10 @@ export async function googleCallback(req: Request, res: Response, next: NextFunc
 }
 ```
 This is `GET /api/auth/google/callback` — where Google redirects the browser
-back to, with `?code=...&state=...` in the URL. The **state check is the
+back to, with `?code=...&state=...` in the URL (Google's own authorization
+`code`, not to be confused with the handoff `code` this function creates a
+few lines later — same word, two different codes, one consumed here to talk
+to Google, one just minted to hand to the browser). The **state check is the
 whole point**: it compares the `state` Google echoed back (which came from
 the URL a real user's browser was sent to) against the `state` stored in
 this browser's signed cookie (set in the step above, on *this same
@@ -842,9 +1098,35 @@ browser, an attacker can't forge it — they'd need to also control the
 victim's cookies, which they don't.
 
 Once state is verified, `loginWithGoogleCode(code)` does the real work
-(§11), and the browser is redirected to the frontend with tokens attached
-(see the **Security notes** in `README.md` for the tradeoffs of that specific
-choice).
+(§11) and returns the real `user`/`tokens` — but notice those never reach
+`redirectUrl` directly. Instead, `createHandoff(user, tokens)` (§11a) stashes
+them and returns an opaque, single-use `handoffCode`, and *that* is the only
+thing put in the redirect URL. The browser lands on the frontend knowing
+nothing more than "a login just succeeded, here's a code" — the actual
+tokens only ever travel in a POST body, next.
+
+```ts
+export async function googleExchange(req: Request, res: Response, next: NextFunction) {
+  try {
+    const result = consumeHandoff(req.body.code);
+    if (!result) {
+      throw new AppError(400, 'Invalid, expired, or already-used exchange code');
+    }
+    res.status(200).json(result);
+  } catch (err) {
+    next(err);
+  }
+}
+```
+This is `POST /api/auth/google/exchange` — the frontend calls it the instant
+it lands on `OAUTH_SUCCESS_REDIRECT_URL?code=...`, trading that code for the
+real `{ user, tokens }`. `consumeHandoff` (§11a) does the heavy lifting:
+returns `undefined` for anything not currently valid — wrong code, expired,
+or already exchanged once — which this function turns into a single, generic
+`400` rather than three different messages (deliberately: distinguishing
+"expired" from "wrong" from "already used" here would tell an attacker
+probing this endpoint more than they need to know, the same enumeration
+concern login's error message avoids, §10).
 
 ---
 
@@ -953,7 +1235,10 @@ benefit of zod's transforms (e.g. `.trim()` on email, defined in
 export const signupSchema = z.object({
   body: z.object({
     email: z.string().trim().email('Must be a valid email address'),
-    password: z.string().min(8, 'Password must be at least 8 characters long'),
+    password: z
+      .string()
+      .min(8, 'Password must be at least 8 characters long')
+      .max(72, 'Password must be at most 72 characters long'),
     name: z.string().trim().min(1).max(100).optional(),
   }),
 });
@@ -968,6 +1253,23 @@ compromised-password database — a reasonable v2 addition, e.g. via the
 HaveIBeenPwned API), but deliberately doesn't add the counterproductive
 complexity rules either.
 
+The `.max(72)`, though, isn't a complexity rule — it's a correctness fix, and
+worth understanding why 72 specifically. bcrypt (the algorithm behind
+`hashPassword`, §5) has a hard, well-known limitation: it only actually
+hashes the first 72 *bytes* of its input and silently ignores anything past
+that — it doesn't error, it just produces the same hash for
+`"a".repeat(80)` as it would for `"a".repeat(72)`. Without this `.max()`,
+that's directly exploitable in a narrow but real way: two *different*
+passwords sharing the same first-72-bytes prefix would hash identically and
+both authenticate successfully, meaning a "200-character password" someone
+believes is very strong could, past its 72nd byte, be contributing nothing
+to security at all. Capping input length at the API boundary makes that
+truncation impossible to reach in the first place. (72 *characters*, not
+bytes, so this is a conservative approximation, not an exact match to
+bcrypt's real limit — a password using many multi-byte UTF-8 characters
+could theoretically still exceed 72 bytes while under 72 characters. Good
+enough to close the realistic case; see `README.md`'s security notes.)
+
 ---
 
 ## 16. `src/middleware/rateLimit.middleware.ts`
@@ -981,11 +1283,18 @@ export const authRateLimiter = rateLimit({
   message: { error: { message: 'Too many attempts, please try again later' } },
 });
 ```
-Applied only to `signup`/`login`/`refresh` (§17) — allows 20 requests per IP
-per 15-minute window before responding `429 Too Many Requests`. This is a
-coarse, first-line defense against brute-forcing passwords or hammering the
-signup endpoint; it's per-IP and in-memory (see the caveats in `README.md`
-about what that does and doesn't protect against at scale).
+Applied to `signup`/`login`/`refresh`/`logout`/`google/exchange` (§17) —
+allows 20 requests per IP per 15-minute window before responding `429 Too
+Many Requests`. This is a coarse, first-line defense against brute-forcing
+passwords, hammering the signup endpoint, or guessing at refresh/exchange
+codes; it's per-IP and in-memory (see the caveats in `README.md` about what
+that does and doesn't protect against at scale). `logout` carries the same
+limiter as the others for a specific reason: it's the one mutation route
+that used to be left unlimited (an earlier version only put it on
+`signup`/`login`/`refresh`), which meant an attacker could send unbounded
+`POST /logout` requests trying guessed `refreshToken` values against
+`prisma.refreshToken.updateMany` with no per-IP throttling at all — every
+other token-touching route was rate-limited, this one just got missed.
 
 ---
 
@@ -995,28 +1304,45 @@ about what that does and doesn't protect against at scale).
 authRouter.post('/signup', authRateLimiter, validate(signupSchema), authController.signup);
 authRouter.post('/login', authRateLimiter, validate(loginSchema), authController.login);
 authRouter.post('/refresh', authRateLimiter, validate(refreshSchema), authController.refresh);
-authRouter.post('/logout', validate(refreshSchema), authController.logout);
+authRouter.post('/logout', authRateLimiter, validate(refreshSchema), authController.logout);
 authRouter.get('/me', requireAuth, authController.me);
 
 authRouter.get('/google', authController.googleRedirect);
 authRouter.get('/google/callback', authController.googleCallback);
+authRouter.post(
+  '/google/exchange',
+  authRateLimiter,
+  validate(googleExchangeSchema),
+  authController.googleExchange,
+);
 ```
 Express middleware runs left to right. For `POST /signup`: rate-limit check
 first (cheapest, rejects abuse before doing any real work) → validate the
 body shape → only then does the actual controller function run. `/me` runs
 `requireAuth` first — if that calls `next(err)` instead of `next()`, the
-controller function never executes at all.
+controller function never executes at all. Every mutating auth route now
+carries `authRateLimiter` — `/logout` included, unlike an earlier version of
+this file (see §16 for why that mattered) — while the two `GET` routes that
+just redirect the browser through Google's own consent screen don't need it
+the same way.
 
 ---
 
 ## 18. `src/app.ts` — assembling the Express app
 
 ```ts
+function corsOrigin(): boolean | string[] {
+  if (env.CORS_ALLOWED_ORIGINS) {
+    return env.CORS_ALLOWED_ORIGINS.split(',').map((origin) => origin.trim());
+  }
+  return env.NODE_ENV === 'production' ? false : true;
+}
+
 export function createApp() {
   const app = express();
 
   app.use(helmet());
-  app.use(cors());
+  app.use(cors({ origin: corsOrigin() }));
   app.use(express.json());
   app.use(cookieParser(env.COOKIE_SECRET));
 
@@ -1033,11 +1359,34 @@ Order matters throughout:
 - `helmet()` — sets a batch of security-related HTTP response headers
   (`X-Content-Type-Options`, a conservative default CSP, etc.) — applied
   first so it covers every response, including error responses.
-- `cors()` — enables Cross-Origin Resource Sharing (default: permissive,
-  reflects the request's origin) so a frontend on a different
-  domain/port can call this API from the browser. In production this should
-  usually be narrowed to specific allowed origins (`cors({ origin: [...] })`)
-  — left open here since no frontend origin was specified.
+- `cors({ origin: corsOrigin() })` — enables Cross-Origin Resource Sharing so
+  a frontend on a different domain/port can call this API from a browser.
+  `corsOrigin()` decides *which* origins are allowed, and its three-way
+  branch is worth reading closely, because an earlier version of this file
+  just called `cors()` with no arguments at all — the library's own default,
+  which is `Access-Control-Allow-Origin: *`, reflecting literally any
+  origin, on literally every route in the API, with no way to narrow it
+  short of editing code. That's a real widening of the attack surface: it
+  means any website, anywhere, can have a visiting browser make
+  authenticated-looking fetch calls to this API and read the JSON responses
+  (the browser's Same-Origin Policy is exactly what CORS headers are
+  overriding here — `*` opts out of that protection entirely, for every
+  caller, unconditionally). `corsOrigin()` fixes that by making the open
+  case something the deploy has to opt into, not the shipped default:
+  - **An allowlist is configured** (`CORS_ALLOWED_ORIGINS` is set) — only
+    those exact origins, split on commas. This is the real production setup.
+  - **Nothing configured, but `NODE_ENV` is `production`** — returns
+    `false`, meaning cross-origin requests are refused across the board.
+    This is the important branch: it means forgetting to set
+    `CORS_ALLOWED_ORIGINS` in a production deploy fails *closed* (nothing
+    works cross-origin until it's configured) rather than *open* (silently
+    falling back to allowing everyone) — a misconfiguration that's loud and
+    breaks the frontend immediately is much easier to catch than one that
+    quietly leaves an API globally readable.
+  - **Nothing configured, and not production** — returns `true`, which `cors`
+    treats as "reflect whatever `Origin` header the request sent." This is
+    the convenience default for local development, where a frontend might be
+    running on any of several arbitrary ports.
 - `express.json()` — parses `application/json` request bodies into
   `req.body`; without this, `req.body` would be `undefined` and every
   `validate(...)` call would fail.
@@ -1144,11 +1493,30 @@ The most involved test file, matching the most involved source file:
 - `rotateRefreshToken`: one test per branch of the function — unknown token
   → rejected; already-revoked token → rejected *and* asserts
   `updateMany` was called with `{ userId, revokedAt: null }` (the mass
-  revocation on reuse-detection); expired token → rejected; a genuinely
-  valid token → returns a new pair, different from the input, and asserts
-  `$transaction` was called exactly once (proving rotation is atomic).
+  revocation on reuse-detection); expired token → rejected; a valid token →
+  claims it via the conditional `updateMany({ where: { id, revokedAt: null } })`
+  and returns a new pair; and — the regression test for the race condition
+  described in §9 — a **lost claim** (`updateMany` mocked to return
+  `{ count: 0 }`, simulating a concurrent caller winning the race first) is
+  asserted to be treated exactly like the already-revoked branch: rejected
+  with the same `401`, `refreshToken.create` never called, and the mass
+  revoke-for-user fired. Testing `prisma.$transaction`'s interactive form
+  here means mocking it to actually *invoke* its callback
+  (`prismaMock.$transaction.mockImplementation((cb) => cb(prismaMock))`,
+  passing `prismaMock` itself as the stand-in for `tx`) rather than just
+  resolving a value, since the function under test relies on that callback
+  actually running to reach the `updateMany`/`create` calls being asserted on.
 - `revokeRefreshToken`: asserts the `updateMany` call's `where`/`data`
   shape matches what logout is supposed to do.
+
+### `tests/unit/oauthHandoff.service.test.ts`
+Direct tests for the handoff store (§11a), separate from the OAuth flow
+that normally drives it: round-trips a stashed user/tokens pair through its
+code; confirms it's genuinely single-use (a second `consumeHandoff` of the
+same code returns `undefined`); rejects a code that was never issued; and —
+using `jest.useFakeTimers()` to fast-forward past the 60-second TTL without
+an actual 60-second test — confirms an expired code is rejected even on its
+first-ever consume attempt.
 
 ### `tests/unit/auth.service.test.ts`
 Mocks `token.service` itself at the module level
@@ -1156,19 +1524,31 @@ Mocks `token.service` itself at the module level
 purely about signup/login *logic*, not re-testing token issuance (already
 covered above) — a good example of testing one unit at a time rather than
 re-verifying the same behavior in every file that happens to call it.
-Confirms: duplicate email → `409`; a successful signup normalizes the email
-(trims/lowercases) and never writes/returns the plaintext password; login
-against a nonexistent account, a Google-only account (no password), and a
-wrong password *all* produce the exact same `401` message (locking in the
-enumeration-resistance property described in §10); a correct login returns
-the user and tokens.
+Confirms: duplicate email (caught by the fast-path `findUnique` check) →
+`409`; a successful signup normalizes the email (trims/lowercases) and never
+writes/returns the plaintext password; login against a nonexistent account,
+a Google-only account (no password), and a wrong password *all* produce the
+exact same `401` message (locking in the enumeration-resistance property
+described in §10); a correct login returns the user and tokens. Two more
+tests exercise the race-condition fix specifically: `findUnique` mocked to
+report "no existing user" while `prisma.user.create` is mocked to *reject*
+with a real `Prisma.PrismaClientKnownRequestError` (`code: 'P2002'`,
+constructed the same way Prisma itself would throw it) — simulating the
+fast-path check missing a real concurrent duplicate — asserts the result is
+still a clean `409`, not a `500`; a companion test rejects `create` with a
+plain, unrelated `Error` and asserts that one is genuinely re-thrown as-is,
+proving the `catch` block only special-cases `P2002` and doesn't swallow or
+mislabel other database failures.
 
 ### `tests/unit/google.service.test.ts`
 Covers all three branches of `findOrCreateGoogleUser` from §11: already
-linked → returned as-is, no writes; matching email + verified → linked via
-`update`; matching email + **not** verified → rejected, `update` never
-called (the account-takeover guard, explicitly tested); no match at all →
-`create` called with `passwordHash: null`.
+linked → returned as-is, `findFirst` called exactly once (locking in the
+single-round-trip fix — the earlier two-`findUnique`-calls version would
+still have passed a test asserting the *result*, so this explicitly checks
+the call count too); matching email + verified → linked via `update`;
+matching email + **not** verified → rejected, `update` never called (the
+account-takeover guard, explicitly tested); no match at all → `create`
+called with `passwordHash: null`.
 
 ### `tests/unit/auth.middleware.test.ts`
 Builds fake Express `req`/`res`/`next` objects by hand (no need for a real
@@ -1183,13 +1563,22 @@ Uses `supertest(app)` to send real HTTP requests into the actual Express app
 (`createApp()`) — routing, middleware order, validation, and JSON
 serialization are all exercised for real; only the database is mocked.
 Confirms, end-to-end through the HTTP layer: invalid email/short password →
-`400` with a validation message; a full valid signup → `201`, and the
-response JSON genuinely has no `passwordHash` field anywhere in it; duplicate
-email → `409`; login against a nonexistent account → `401`; `/me` with no
-auth header → `401`; `GET /auth/google` → a real `302` redirect whose
-`Location` header points at `accounts.google.com`, with the `oauth_state`
-cookie actually set on the response; any unrecognized route → a clean `404`
-JSON error (proving `notFoundHandler` is wired in correctly).
+`400` with a validation message; a password over 72 characters → `400`; a
+full valid signup → `201`, and the response JSON genuinely has no
+`passwordHash` field anywhere in it; duplicate email (via the fast-path
+check) → `409`; duplicate email caught only by the database's own unique
+constraint (a mocked `P2002` from `create`, same as the service-level test
+above but exercised through the full HTTP stack) → `409`, not `500`; login
+against a nonexistent account → `401`; `/me` with no auth header → `401`;
+`GET /auth/google` → a real `302` redirect whose `Location` header points at
+`accounts.google.com`, with the `oauth_state` cookie actually set on the
+response; `POST /auth/google/exchange` → an unknown code rejected with
+`400`, and a code obtained by calling `createHandoff` directly (standing in
+for what `googleCallback` would have done) successfully exchanged once and
+rejected the second time it's tried — proving the single-use property holds
+through the actual route, not just the service function in isolation; any
+unrecognized route → a clean `404` JSON error (proving `notFoundHandler` is
+wired in correctly).
 
 ---
 
@@ -1199,17 +1588,21 @@ To tie it all together, here's literally everything that happens for one
 `POST /api/auth/signup` call, in order:
 
 1. `server.ts`'s `app.listen(...)` has an Express app (`app.ts`) listening.
-2. Request hits `helmet()` → `cors()` → `express.json()` (parses the JSON
-   body into `req.body`) → `cookieParser()`.
+2. Request hits `helmet()` → `cors({ origin: corsOrigin() })` →
+   `express.json()` (parses the JSON body into `req.body`) → `cookieParser()`.
 3. Express matches `/api/auth/*` → into `auth.routes.ts`.
 4. `authRateLimiter` — allowed to proceed (under the limit).
-5. `validate(signupSchema)` — checks `req.body.{email,password,name}`; if
-   invalid, responds `400` immediately and nothing further runs.
+5. `validate(signupSchema)` — checks `req.body.{email,password,name}`
+   (password length now bounded on both ends, 8–72); if invalid, responds
+   `400` immediately and nothing further runs.
 6. `authController.signup` — calls `authService.signup(req.body)`.
 7. Inside `auth.service.ts`: normalize email → `prisma.user.findUnique` (a
-   real Postgres query) → if found, throw `AppError(409, ...)` → otherwise
-   `hashPassword` (bcrypt, ~50-100ms) → `prisma.user.create` (real `INSERT`)
-   → `issueTokenPair(user)`.
+   real Postgres query, the fast-path duplicate check) → if found, throw
+   `AppError(409, ...)` → otherwise `hashPassword` (bcrypt, ~50-100ms) →
+   `prisma.user.create` (real `INSERT`, wrapped in a `try`/`catch` that
+   turns a `P2002` unique-constraint violation — the race the fast-path
+   check can't fully close — into that same `409` rather than a `500`) →
+   `issueTokenPair(user)`.
 8. Inside `token.service.ts`: `signAccessToken` (sync, instant) +
    `generateRawRefreshToken` + `prisma.refreshToken.create` (another real
    `INSERT`, storing only the hash).

@@ -25,21 +25,20 @@ const profile = {
 };
 
 describe('google.service findOrCreateGoogleUser', () => {
-  it('returns the existing user when already linked by googleId', async () => {
+  it('returns the existing user when already linked by googleId, via a single lookup', async () => {
     const existing = buildUser({ googleId: profile.googleId });
-    prismaMock.user.findUnique.mockResolvedValueOnce(existing);
+    prismaMock.user.findFirst.mockResolvedValue(existing);
 
     const result = await findOrCreateGoogleUser(profile);
 
     expect(result).toBe(existing);
+    expect(prismaMock.user.findFirst).toHaveBeenCalledTimes(1);
     expect(prismaMock.user.update).not.toHaveBeenCalled();
     expect(prismaMock.user.create).not.toHaveBeenCalled();
   });
 
   it('links googleId onto a matching-email account when the email is verified', async () => {
-    prismaMock.user.findUnique
-      .mockResolvedValueOnce(null) // no match by googleId
-      .mockResolvedValueOnce(buildUser({ googleId: null })); // match by email
+    prismaMock.user.findFirst.mockResolvedValue(buildUser({ googleId: null }));
     prismaMock.user.update.mockResolvedValue(
       buildUser({ googleId: profile.googleId, isEmailVerified: true }),
     );
@@ -55,9 +54,7 @@ describe('google.service findOrCreateGoogleUser', () => {
   });
 
   it('refuses to link an existing account when Google has not verified the email', async () => {
-    prismaMock.user.findUnique
-      .mockResolvedValueOnce(null)
-      .mockResolvedValueOnce(buildUser({ googleId: null }));
+    prismaMock.user.findFirst.mockResolvedValue(buildUser({ googleId: null }));
 
     await expect(
       findOrCreateGoogleUser({ ...profile, emailVerified: false }),
@@ -66,7 +63,7 @@ describe('google.service findOrCreateGoogleUser', () => {
   });
 
   it('creates a brand-new password-less account when no match exists at all', async () => {
-    prismaMock.user.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(null);
+    prismaMock.user.findFirst.mockResolvedValue(null);
     prismaMock.user.create.mockResolvedValue(
       buildUser({ googleId: profile.googleId, passwordHash: null }),
     );
