@@ -1,0 +1,46 @@
+// Prisma schema for the auth service.
+// Docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id              String    @id @default(uuid())
+  email           String    @unique
+  // Null for accounts created purely via Google OAuth (no password set).
+  passwordHash    String?
+  name            String?
+  // Google's stable "sub" claim. Null until the account is linked to Google.
+  googleId        String?   @unique
+  isEmailVerified Boolean   @default(false)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  refreshTokens   RefreshToken[]
+
+  @@map("users")
+}
+
+model RefreshToken {
+  id                  String    @id @default(uuid())
+  // SHA-256 hash of the opaque refresh token. The raw value is only ever
+  // returned to the client once and never persisted.
+  tokenHash           String    @unique
+  userId              String
+  user                User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt           DateTime
+  revokedAt           DateTime?
+  // Hash of the token that replaced this one, set on rotation. Useful for
+  // audit trails / reuse detection.
+  replacedByTokenHash String?
+  createdAt           DateTime  @default(now())
+
+  @@index([userId])
+  @@map("refresh_tokens")
+}
