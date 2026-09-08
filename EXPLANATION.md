@@ -165,6 +165,17 @@ const envSchema = z.object({
   GOOGLE_REDIRECT_URI: z.string().url(),
   OAUTH_SUCCESS_REDIRECT_URL: z.string().url(),
   CORS_ALLOWED_ORIGINS: z.string().optional(),
+  ALLOW_ANY_CORS_ORIGIN: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
+  TRUST_PROXY: z.string().optional(),
+  JSON_BODY_LIMIT: z.string().default('10kb'),
+  RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(15 * 60 * 1000),
+  RATE_LIMIT_STRICT_MAX: z.coerce.number().int().positive().default(30),
+  RATE_LIMIT_STANDARD_MAX: z.coerce.number().int().positive().default(100),
+  JWT_ISSUER: z.string().min(1).default('auth-service'),
+  JWT_AUDIENCE: z.string().min(1).default('auth-service'),
 });
 
 export const env = envSchema.parse(process.env);
@@ -193,9 +204,29 @@ export const env = envSchema.parse(process.env);
   short unit like `15m`/`1h`/`7d`) makes the two actually agree — an invalid
   value now fails at the same `envSchema.parse()` call as every other
   misconfiguration.
-- `CORS_ALLOWED_ORIGINS` is `.optional()` on purpose (see `app.ts`, §18) —
-  its *absence* means something different depending on `NODE_ENV`, so it
-  can't just have a hardcoded default here.
+- `CORS_ALLOWED_ORIGINS` is `.optional()`, and `ALLOW_ANY_CORS_ORIGIN` is the
+  *only* other input `app.ts`'s CORS logic (§18) looks at — deliberately not
+  `NODE_ENV`. An earlier version of that logic branched on
+  `NODE_ENV === 'production'` (later `=== 'development'`) to decide whether
+  cross-origin requests should be wide open by default; either way, that ties
+  a security-relevant default to a setting (`NODE_ENV`, defaulted to
+  `'development'` right above) that a real deployment can simply forget to
+  set. `ALLOW_ANY_CORS_ORIGIN` defaults to `false` with no such failure mode.
+- `ALLOW_ANY_CORS_ORIGIN`'s `.enum(['true', 'false']).transform(...)` rather
+  than `z.coerce.boolean()` is deliberate, and worth understanding why:
+  `z.coerce.boolean()` coerces via JavaScript's `Boolean()` constructor,
+  under which `Boolean("false")` is `true` — **any non-empty string is
+  truthy**, including the literal string `"false"`. Had this field used
+  `z.coerce.boolean()`, writing `ALLOW_ANY_CORS_ORIGIN=false` in a `.env`
+  file would have silently meant "true" — a classic zod footgun, caught here
+  before it shipped rather than after. The `.enum(...)` only accepts the two
+  literal strings and `.transform` maps them to real booleans explicitly.
+- `TRUST_PROXY`, `JSON_BODY_LIMIT`, and the `RATE_LIMIT_*` trio are all plain
+  strings/numbers with defaults chosen to work out of the box for local dev
+  — see `app.ts` (§18) and `rateLimit.middleware.ts` (§16) for what each one
+  actually controls.
+- `JWT_ISSUER`/`JWT_AUDIENCE` default to `'auth-service'` — see `jwt.ts` (§7)
+  for what they're checked against.
 - `envSchema.parse(process.env)` — **throws immediately** if anything is
   missing or malformed. This means a missing `GOOGLE_CLIENT_SECRET` crashes
   the app the instant it starts (with a clear zod error naming the field),
@@ -307,6 +338,8 @@ export interface AccessTokenPayload {
 export function signAccessToken(payload: AccessTokenPayload): string {
   return jwt.sign(payload, env.JWT_ACCESS_SECRET, {
     expiresIn: env.JWT_ACCESS_TTL,
+    issuer: env.JWT_ISSUER,
+    audience: env.JWT_AUDIENCE,
   });
 }
 ```
@@ -320,10 +353,16 @@ export function signAccessToken(payload: AccessTokenPayload): string {
   which is exactly why it only contains a user id and email, nothing
   sensitive), and an HMAC-SHA256 signature over both, computed with
   `JWT_ACCESS_SECRET`. `expiresIn` bakes an `exp` claim into the payload.
+- `issuer`/`audience` add `iss`/`aud` claims — a name for "who issued this"
+  and "who it's for." On their own, at sign time, these don't add
+  protection — they only matter once `verify` actually checks them, next.
 
 ```ts
 export function verifyAccessToken(token: string): AccessTokenPayload {
-  const decoded = jwt.verify(token, env.JWT_ACCESS_SECRET);
+  const decoded = jwt.verify(token, env.JWT_ACCESS_SECRET, {
+    issuer: env.JWT_ISSUER,
+    audience: env.JWT_AUDIENCE,
+  });
   if (typeof decoded === 'string' || !decoded.sub || !decoded.email) {
     throw new jwt.JsonWebTokenError('Malformed access token payload');
   }
@@ -332,9 +371,21 @@ export function verifyAccessToken(token: string): AccessTokenPayload {
 ```
 - `jwt.verify` recomputes the HMAC signature using the same secret and
   compares it to the one embedded in the token; **throws** (doesn't return a
-  falsy value) if the signature doesn't match, the token is expired, or it's
-  malformed. This is why the caller (`auth.middleware.ts`) wraps this in
-  `try/catch`.
+  falsy value) if the signature doesn't match, the token is expired, the
+  `iss`/`aud` claims don't match what's passed here, or it's malformed. This
+  is why the caller (`auth.middleware.ts`) wraps this in `try/catch`.
+- Passing `issuer`/`audience` to `verify` (not just `sign`) is what actually
+  does something: without it, a token with the *wrong* `iss`/`aud` — but
+  otherwise correctly signed — would verify successfully anyway, since
+  `jwt.verify` only checks claims it's explicitly told to check. For a
+  single, self-contained service like this one, that gap is low-risk today.
+  It stops being low-risk the moment `JWT_ACCESS_SECRET` is ever reused or
+  shared with another service (a common shortcut when standing up a second
+  internal service quickly) — without `audience` verification, a token
+  legitimately issued *for that other service* would also be accepted here,
+  and vice versa. Checking `iss`/`aud` is what keeps "signed with the same
+  secret" from silently becoming "usable anywhere that secret is known,"
+  cheaply, before there's ever a second service to worry about.
 - `typeof decoded === 'string'` — `jwt.verify`'s TypeScript types allow the
   decoded value to be a plain string (for tokens signed without an object
   payload); that branch can't happen for tokens *this app* issues, but
@@ -844,7 +895,22 @@ sequential ones:
    Requiring Google's own verification closes that off.
 3. **No match at all** (`existing` is `null`) — brand new user,
    `passwordHash: null` (they can never log in with a password — only
-   Google — unless a "set a password" feature is added later).
+   Google — unless a "set a password" feature is added later). The `create()`
+   for this case is wrapped in a `try`/`catch` for exactly the same reason as
+   `auth.service.ts`'s `signup()` (§10): the `findFirst` above is a fast-path
+   check, not a guard. Two Google logins for the same brand-new account
+   arriving close together (a double-click on "Continue with Google," or two
+   tabs) can both see "no existing user" and both reach `create()` — only one
+   `INSERT` can win against the `email`/`googleId` unique constraints.
+   Without the catch, the loser would throw a raw, unhandled
+   `PrismaClientKnownRequestError` straight into `errorHandler`'s generic
+   `500` branch, on what is, from that user's perspective, a *successful*
+   login. The catch specifically checks for Prisma's `P2002` (unique
+   constraint violation) code and, on that specific error, re-runs the same
+   `findFirst` lookup — the concurrent request that won the race already
+   created (or linked) the row, so fetching it and returning it is the
+   correct outcome, not a failure. Any other error still propagates
+   unchanged.
 
 **Why one query is safe here, not just faster.** The earlier version ran
 `findUnique` by `googleId`, and only if that missed, a *second* `findUnique`
@@ -927,6 +993,8 @@ only ever calls `createHandoff`/`consumeHandoff`, never touches `store`
 directly.
 
 ```ts
+const MAX_HANDOFF_ENTRIES = 1000;
+
 function purgeExpired(): void {
   const now = Date.now();
   for (const [code, entry] of store) {
@@ -936,15 +1004,32 @@ function purgeExpired(): void {
 
 export function createHandoff(user: PublicUser, tokens: TokenPair): string {
   purgeExpired();
+  if (store.size >= MAX_HANDOFF_ENTRIES) {
+    const oldestKey = store.keys().next().value;
+    if (oldestKey !== undefined) {
+      store.delete(oldestKey);
+    }
+  }
   const code = crypto.randomBytes(24).toString('hex');
   store.set(code, { user, tokens, expiresAt: Date.now() + HANDOFF_TTL_MS });
   return code;
 }
 ```
 `purgeExpired()` runs on every `createHandoff` call rather than on a timer —
-simple, and sufficient: since a real OAuth login is the only thing that ever
-calls this, the store can only ever accumulate entries roughly as fast as
-people log in, and each login opportunistically sweeps out anything stale.
+simple, and sufficient for the *expected* case: since a real OAuth login is
+the only thing that ever calls this, the store can only ever accumulate
+entries roughly as fast as people log in, and each login opportunistically
+sweeps out anything stale. `MAX_HANDOFF_ENTRIES` is a second, independent
+safeguard on top of that, not a replacement for it — a defensive backstop
+for a case `purgeExpired()` alone doesn't cover: a *sustained burst* of
+logins, all landing within the same ~60-second TTL window, faster than they
+individually expire. Nothing about that scenario is a bug in the purge logic
+— it's just what "bounded by TTL, not by count" means, and in a long-running
+process, an unbounded burst is still a way to grow this map without limit.
+`store.keys().next().value` reads the *first* key `Map`'s iterator would
+yield — because `Map` iterates in insertion order, that's reliably the
+oldest surviving entry, so hitting the cap evicts the one entry closest to
+expiring anyway, not an arbitrary one.
 `crypto.randomBytes(24)` — the same cryptographically-secure random source
 used for refresh tokens (`token.service.ts`, §9) — generates the code
 itself; guessing a valid one is infeasible for the same reason guessing a
@@ -1176,10 +1261,28 @@ runs and turns it into a proper `AppError`, so even 404s get the same
 consistent JSON error shape as everything else.
 
 ```ts
+function asExposedHttpError(err: unknown): { statusCode: number; message: string } | undefined {
+  if (!(err instanceof Error)) return undefined;
+  const candidate = err as Error & { statusCode?: unknown; status?: unknown; expose?: unknown };
+  if (candidate.expose !== true) return undefined;
+  const statusCode =
+    typeof candidate.statusCode === 'number' ? candidate.statusCode : candidate.status;
+  if (typeof statusCode !== 'number' || statusCode < 400 || statusCode >= 500) return undefined;
+  return { statusCode, message: candidate.message };
+}
+
 export function errorHandler(err: unknown, _req: Request, res: Response, _next: NextFunction) {
   if (err instanceof AppError) {
     return res.status(err.statusCode).json({ error: { message: err.message } });
   }
+
+  const exposedHttpError = asExposedHttpError(err);
+  if (exposedHttpError) {
+    return res.status(exposedHttpError.statusCode).json({
+      error: { message: exposedHttpError.message },
+    });
+  }
+
   console.error('Unhandled error:', err);
   return res.status(500).json({ error: { message: 'Internal server error' } });
 }
@@ -1190,7 +1293,7 @@ how Express distinguishes it from a normal middleware function; this is why
 `_req` and `_next` are kept even though unused (renamed with a leading `_`
 so the `noUnusedParameters` TypeScript check doesn't complain).
 
-The branch is the crucial security property of this whole file: known,
+The first branch is the crucial security property of this whole file: known,
 "expected" errors (`AppError` — wrong password, duplicate email, expired
 token, ...) are shown to the client with their specific message. Anything
 *else* — a bug, a database connection failure, an unexpected exception deep
@@ -1199,6 +1302,27 @@ real deploy would send it to a log aggregator/error tracker) but the client
 only ever sees a generic `"Internal server error"`. This is what prevents,
 say, a raw Postgres constraint-violation message (which can reveal schema
 details) or a stack trace from ever reaching a client response.
+
+**`asExposedHttpError` exists to close a gap the `AppError` check alone
+misses.** Not every error this app can throw is one this codebase wrote:
+`express.json()` (`app.ts`, §18) throws its own errors for things like a
+body over `JSON_BODY_LIMIT` (`PayloadTooLargeError`, status `413`) or
+malformed JSON (a `SyntaxError`, status `400`) — neither is an `AppError`
+instance, so without this function, both fell through to the generic `500`
+branch: correct in spirit (never crash), wrong in specifics (a client
+sending too much data, or broken JSON, would see "Internal server error"
+instead of a status telling them what was actually wrong — genuinely
+confusing feedback for something that isn't a bug at all). The fix isn't to
+special-case `PayloadTooLargeError` and `SyntaxError` by name, though —
+those are just two examples of errors built on the `http-errors` package's
+convention (used throughout the Express ecosystem, including by body-parser
+internally): a plain `Error` carrying `.statusCode`/`.status` and an
+`.expose` flag, where `expose: true` is that convention's own signal that
+the message is safe to show a client (as opposed to a `5xx` where it isn't
+— `http-errors` sets `expose: false` for those). `asExposedHttpError` reads
+that same signal directly, so it correctly handles *any* well-behaved
+middleware's exposed 4xx error, present or future, not just the two that
+happened to get tested.
 
 ---
 
@@ -1214,7 +1338,14 @@ export function validate(schema: AnyZodObject) {
         .join('; ');
       return next(new AppError(400, message));
     }
-    req.body = result.data.body ?? req.body;
+    const data = result.data as { body?: unknown; query?: unknown; params?: unknown };
+    req.body = data.body ?? req.body;
+    if (data.query !== undefined) {
+      req.query = data.query as Request['query'];
+    }
+    if (data.params !== undefined) {
+      req.params = data.params as Request['params'];
+    }
     next();
   };
 }
@@ -1226,10 +1357,23 @@ reused for every different shape of input. `safeParse` (rather than `parse`)
 returns a result object instead of throwing, so this can convert a
 validation failure into a clean `AppError(400, ...)` with a readable message
 listing every field that failed and why, instead of a raw zod exception.
-`req.body = result.data.body` — after validation, replaces `req.body` with
-zod's *parsed* output rather than the raw input, so downstream code gets the
-benefit of zod's transforms (e.g. `.trim()` on email, defined in
-`auth.validators.ts` below) automatically.
+
+Writing the parsed result back onto `req` — not just `body`, but `query` and
+`params` too — is what makes downstream code actually see zod's *output*
+(trimmed strings, coerced numbers, whatever transforms a schema applies)
+rather than the raw request. An earlier version of this function only wrote
+back `req.body`, even though it validated `query`/`params` too (they're
+right there in the object passed to `safeParse`) — every schema this app
+currently defines only covers `body`, so that gap was never *observed*
+(there was nothing for it to silently drop), but it was still real: the
+moment any route added a schema with a `query` shape — pagination params, a
+search filter, anything coerced like `page: z.coerce.number()` — that
+route's `req.query` would keep the raw, unparsed strings, silently
+contradicting what the schema claims to guarantee. `data.query !== undefined`
+guards each write independently, since most schemas here still only define
+`body` — for those, `result.data.query` is genuinely `undefined` (zod's
+default behavior strips keys a schema doesn't define), and the corresponding
+`if` simply never fires, leaving `req.query` exactly as Express gave it.
 
 ```ts
 export const signupSchema = z.object({
@@ -1275,43 +1419,72 @@ enough to close the realistic case; see `README.md`'s security notes.)
 ## 16. `src/middleware/rateLimit.middleware.ts`
 
 ```ts
-export const authRateLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  limit: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: { message: 'Too many attempts, please try again later' } },
-});
+function makeLimiter(max: number) {
+  return rateLimit({
+    windowMs: env.RATE_LIMIT_WINDOW_MS,
+    limit: max,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: { message: 'Too many attempts, please try again later' } },
+  });
+}
+
+export const strictAuthRateLimiter = makeLimiter(env.RATE_LIMIT_STRICT_MAX);
+export const standardAuthRateLimiter = makeLimiter(env.RATE_LIMIT_STANDARD_MAX);
 ```
-Applied to `signup`/`login`/`refresh`/`logout`/`google/exchange` (§17) —
-allows 20 requests per IP per 15-minute window before responding `429 Too
-Many Requests`. This is a coarse, first-line defense against brute-forcing
-passwords, hammering the signup endpoint, or guessing at refresh/exchange
-codes; it's per-IP and in-memory (see the caveats in `README.md` about what
-that does and doesn't protect against at scale). `logout` carries the same
-limiter as the others for a specific reason: it's the one mutation route
-that used to be left unlimited (an earlier version only put it on
-`signup`/`login`/`refresh`), which meant an attacker could send unbounded
-`POST /logout` requests trying guessed `refreshToken` values against
-`prisma.refreshToken.updateMany` with no per-IP throttling at all — every
-other token-touching route was rate-limited, this one just got missed.
+Two **separate** exported limiters, each its own call to `rateLimit(...)` —
+this shape matters more than it looks like it should, and is worth
+understanding precisely, because an earlier version of this file exported
+one `authRateLimiter` (a single `rateLimit({...})` call) and attached that
+*same instance* to every mutating route in `auth.routes.ts`
+(`signup`/`login`/`refresh`/`logout`/`google/exchange`).
+
+**Why that was a real bug, not just an odd choice.** `express-rate-limit`'s
+counter store lives *inside* the middleware function `rateLimit(...)`
+returns — it's not something Express creates fresh per route. Attaching the
+same middleware *instance* to five different routes means all five draw
+against the *same* counter, per client IP: not "20 signup attempts and,
+separately, 20 login attempts," but "20 requests total, however they're
+split across all five routes." Concretely — a burst of signups (bots, or
+just a busy signup form) can exhaust the shared budget and lock *login* out
+for a completely different, unrelated user behind the same IP, who never
+attempted a signup at all — a real availability problem for anyone behind a
+shared IP (a corporate NAT, a campus network, CGNAT), and it also weakens
+the original brute-force protection the limiter existed for in the first
+place, since an attacker could spend part of the budget on the cheaper
+`/logout` or `/refresh` before ever touching `/login`.
+
+The fix is exactly what `makeLimiter` being a *function* (rather than the
+limiter being one hardcoded value) enables: `strictAuthRateLimiter` and
+`standardAuthRateLimiter` are two independent calls to `rateLimit(...)`,
+each getting its own separate counter store, tuned to two different budgets
+via `env.RATE_LIMIT_STRICT_MAX`/`env.RATE_LIMIT_STANDARD_MAX` — `strict` for
+`signup`/`login` (the genuine brute-force/credential-stuffing surface),
+`standard` for `refresh`/`logout`/`google/exchange` (still worth bounding —
+each one touches the database — but shouldn't compete with login's budget,
+and realistically tolerates more traffic: a client legitimately refreshing
+its access token every 15 minutes over a long session, for instance).
+`windowMs`/the two max values are all read from `env` rather than hardcoded,
+specifically so the numbers can be tuned to real traffic without a code
+change — the values in an earlier version (a single hardcoded `limit: 20`)
+had no such escape hatch.
 
 ---
 
 ## 17. `src/routes/auth.routes.ts` — wiring it all together
 
 ```ts
-authRouter.post('/signup', authRateLimiter, validate(signupSchema), authController.signup);
-authRouter.post('/login', authRateLimiter, validate(loginSchema), authController.login);
-authRouter.post('/refresh', authRateLimiter, validate(refreshSchema), authController.refresh);
-authRouter.post('/logout', authRateLimiter, validate(refreshSchema), authController.logout);
+authRouter.post('/signup', strictAuthRateLimiter, validate(signupSchema), authController.signup);
+authRouter.post('/login', strictAuthRateLimiter, validate(loginSchema), authController.login);
+authRouter.post('/refresh', standardAuthRateLimiter, validate(refreshSchema), authController.refresh);
+authRouter.post('/logout', standardAuthRateLimiter, validate(refreshSchema), authController.logout);
 authRouter.get('/me', requireAuth, authController.me);
 
 authRouter.get('/google', authController.googleRedirect);
 authRouter.get('/google/callback', authController.googleCallback);
 authRouter.post(
   '/google/exchange',
-  authRateLimiter,
+  standardAuthRateLimiter,
   validate(googleExchangeSchema),
   authController.googleExchange,
 );
@@ -1320,11 +1493,22 @@ Express middleware runs left to right. For `POST /signup`: rate-limit check
 first (cheapest, rejects abuse before doing any real work) → validate the
 body shape → only then does the actual controller function run. `/me` runs
 `requireAuth` first — if that calls `next(err)` instead of `next()`, the
-controller function never executes at all. Every mutating auth route now
-carries `authRateLimiter` — `/logout` included, unlike an earlier version of
-this file (see §16 for why that mattered) — while the two `GET` routes that
-just redirect the browser through Google's own consent screen don't need it
-the same way.
+controller function never executes at all.
+
+Which route gets `strictAuthRateLimiter` vs. `standardAuthRateLimiter`
+matches the split explained in §16: `signup`/`login` get the strict budget,
+`refresh`/`logout`/`google/exchange` get the standard one — two genuinely
+separate counters, not the same limiter instance reused five times. `/logout`
+specifically carries a limiter at all (rather than none) for a reason worth
+restating here: it's a mutation that touches the database
+(`prisma.refreshToken.updateMany`) on every call, so leaving it completely
+unbounded would still be a real (if narrow) abuse surface — it just doesn't
+need to share login's stricter budget to be reasonably protected. The two `GET` routes don't carry a limiter: `/google` just redirects to
+Google, and `/google/callback` is driven entirely by Google's own redirect
+(not something an attacker can call at will without first getting Google to
+issue them a valid authorization code) — `/google/exchange`, the route an
+attacker actually *could* hammer directly with guessed handoff codes, is the
+one that carries `standardAuthRateLimiter`.
 
 ---
 
@@ -1335,15 +1519,52 @@ function corsOrigin(): boolean | string[] {
   if (env.CORS_ALLOWED_ORIGINS) {
     return env.CORS_ALLOWED_ORIGINS.split(',').map((origin) => origin.trim());
   }
-  return env.NODE_ENV === 'production' ? false : true;
+  return env.ALLOW_ANY_CORS_ORIGIN;
+}
+```
+`corsOrigin()` decides which origins may call this API from a browser, and
+it's been through two prior versions worth knowing about, because each
+fixed a real (not theoretical) gap the previous one had.
+
+- **Version 1**: just `cors()`, no arguments — the library's own default,
+  `Access-Control-Allow-Origin: *`, reflecting literally any origin on every
+  route, with no way to narrow it short of editing code. Any website,
+  anywhere, could have a visiting browser make fetch calls to this API and
+  read the JSON responses — the browser's Same-Origin Policy is exactly what
+  CORS headers override, and `*` opts out of that protection entirely, for
+  every caller, unconditionally.
+- **Version 2**: `env.NODE_ENV === 'production' ? false : true` — closed in
+  production, open (reflect-any-origin) everywhere else. Better, but still
+  broken in a specific way: `NODE_ENV` (`config/env.ts`, §3) *defaults* to
+  `'development'` when unset. A real deployment that simply forgot to set
+  `NODE_ENV` — not a contrived scenario; it's an easy thing to miss in a
+  hosting platform's config — would silently land in the open branch,
+  exactly the failure this was supposed to prevent, just one layer removed.
+- **Current version**, shown above: `env.ALLOW_ANY_CORS_ORIGIN`, a
+  *dedicated* flag (§3) that defaults to `false` with no such escape hatch —
+  it's never inferred from anything else, so there's no other setting whose
+  default value can accidentally make this permissive. Being open now
+  requires setting `ALLOW_ANY_CORS_ORIGIN=true` on purpose, in every
+  environment including local dev (see `.env.example`).
+
+```ts
+function parseTrustProxy(value: string): boolean | number | string {
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  if (/^\d+$/.test(value)) return Number(value);
+  return value;
 }
 
 export function createApp() {
   const app = express();
 
+  if (env.TRUST_PROXY !== undefined) {
+    app.set('trust proxy', parseTrustProxy(env.TRUST_PROXY));
+  }
+
   app.use(helmet());
   app.use(cors({ origin: corsOrigin() }));
-  app.use(express.json());
+  app.use(express.json({ limit: env.JSON_BODY_LIMIT }));
   app.use(cookieParser(env.COOKIE_SECRET));
 
   app.get('/health', (_req, res) => res.status(200).json({ status: 'ok' }));
@@ -1356,40 +1577,39 @@ export function createApp() {
 }
 ```
 Order matters throughout:
+- **`app.set('trust proxy', ...)`**, first, before any middleware — only
+  when `TRUST_PROXY` is set at all (left alone otherwise, which is Express's
+  own default: proxy trust disabled, correct for a direct-connection local
+  setup). This setting controls where Express thinks a request's real IP
+  comes from. Running behind any reverse proxy or load balancer (nginx, an
+  ALB, Cloudflare, …) without it means every request's `req.ip` resolves to
+  the *proxy's* IP, not the actual client's — and since `req.ip` is exactly
+  what `rateLimit.middleware.ts` (§16) keys its per-client counters on, that
+  silently turns "20 attempts per client" into "20 attempts for every client
+  behind the proxy, combined." (`express-rate-limit` itself also actively
+  guards against the specific danger of trusting a spoofable
+  `X-Forwarded-For` header when it hasn't been told to — which is the flip
+  side of the same coin: getting `TRUST_PROXY` wrong in *either* direction
+  is a real problem, not just a style nit.) `parseTrustProxy` converts the
+  env string into whatever shape Express's setting actually wants — a
+  boolean, a hop count (`"1"` → `1`), or passed through as-is for a preset
+  keyword like `"loopback"` or an IP/CIDR list.
 - `helmet()` — sets a batch of security-related HTTP response headers
   (`X-Content-Type-Options`, a conservative default CSP, etc.) — applied
-  first so it covers every response, including error responses.
-- `cors({ origin: corsOrigin() })` — enables Cross-Origin Resource Sharing so
-  a frontend on a different domain/port can call this API from a browser.
-  `corsOrigin()` decides *which* origins are allowed, and its three-way
-  branch is worth reading closely, because an earlier version of this file
-  just called `cors()` with no arguments at all — the library's own default,
-  which is `Access-Control-Allow-Origin: *`, reflecting literally any
-  origin, on literally every route in the API, with no way to narrow it
-  short of editing code. That's a real widening of the attack surface: it
-  means any website, anywhere, can have a visiting browser make
-  authenticated-looking fetch calls to this API and read the JSON responses
-  (the browser's Same-Origin Policy is exactly what CORS headers are
-  overriding here — `*` opts out of that protection entirely, for every
-  caller, unconditionally). `corsOrigin()` fixes that by making the open
-  case something the deploy has to opt into, not the shipped default:
-  - **An allowlist is configured** (`CORS_ALLOWED_ORIGINS` is set) — only
-    those exact origins, split on commas. This is the real production setup.
-  - **Nothing configured, but `NODE_ENV` is `production`** — returns
-    `false`, meaning cross-origin requests are refused across the board.
-    This is the important branch: it means forgetting to set
-    `CORS_ALLOWED_ORIGINS` in a production deploy fails *closed* (nothing
-    works cross-origin until it's configured) rather than *open* (silently
-    falling back to allowing everyone) — a misconfiguration that's loud and
-    breaks the frontend immediately is much easier to catch than one that
-    quietly leaves an API globally readable.
-  - **Nothing configured, and not production** — returns `true`, which `cors`
-    treats as "reflect whatever `Origin` header the request sent." This is
-    the convenience default for local development, where a frontend might be
-    running on any of several arbitrary ports.
-- `express.json()` — parses `application/json` request bodies into
-  `req.body`; without this, `req.body` would be `undefined` and every
-  `validate(...)` call would fail.
+  early so it covers every response, including error responses.
+- `cors({ origin: corsOrigin() })` — see above.
+- `express.json({ limit: env.JSON_BODY_LIMIT })` — parses `application/json`
+  request bodies into `req.body`; without this middleware at all,
+  `req.body` would be `undefined` and every `validate(...)` call would fail.
+  The explicit `limit` (an earlier version omitted it, silently relying on
+  body-parser's own unmentioned 100kb default) matters for two reasons: it's
+  self-documenting — a reader doesn't have to already know body-parser's
+  default to understand what's allowed — and it lets this specific API (a
+  handful of short string fields, no file uploads) bound the limit tighter
+  than a one-size-fits-all default, so an oversized body gets rejected
+  before it's ever fully buffered into memory. See `error.middleware.ts`
+  (§14) for how the resulting `PayloadTooLargeError` becomes a proper `413`
+  instead of a generic `500`.
 - `cookieParser(env.COOKIE_SECRET)` — parses the `Cookie` header into
   `req.cookies` (unsigned) and `req.signedCookies` (verified against
   `COOKIE_SECRET`) — this second one is what `googleCallback` reads to check
@@ -1411,13 +1631,85 @@ Order matters throughout:
 
 ```ts
 const app = createApp();
-app.listen(env.PORT, () => {
+const server = app.listen(env.PORT, () => {
   console.log(`auth-service listening on port ${env.PORT} (${env.NODE_ENV})`);
 });
 ```
 The only file that calls `.listen(...)` — kept separate from `app.ts`
 specifically so tests (`supertest(app)`) can exercise the whole HTTP stack
-in-process, without binding a real port at all.
+in-process, without binding a real port at all. Capturing the return value
+as `server` (an earlier version discarded it) is what makes everything
+below possible — both the error handler and the graceful shutdown need a
+handle on the actual HTTP server object, not just the Express app.
+
+```ts
+server.on('error', (err) => {
+  console.error('Failed to start server:', err);
+  process.exit(1);
+});
+```
+Without this, a startup failure — most commonly `EADDRINUSE`, the port
+already being in use — surfaces as an **unhandled** `'error'` event on the
+server object. In Node, an unhandled `'error'` event on an `EventEmitter`
+throws, which for a bare `app.listen(...)` with nothing listening for it
+means a confusing, generic crash instead of a clear "here's what actually
+went wrong" message. This turns that into an intentional, informative exit.
+
+```ts
+let shuttingDown = false;
+
+function shutdown(signal: string): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+
+  console.log(`${signal} received, shutting down gracefully...`);
+
+  server.close(async (closeErr) => {
+    if (closeErr) console.error('Error while closing HTTP server:', closeErr);
+    await prisma.$disconnect();
+    process.exit(closeErr ? 1 : 0);
+  });
+
+  setTimeout(() => {
+    console.error('Graceful shutdown timed out after 10s, forcing exit');
+    process.exit(1);
+  }, 10_000).unref();
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+```
+Without any of this, the *default* behavior of a Node process receiving
+`SIGTERM` — the signal a container orchestrator (Docker, Kubernetes, most
+PaaS platforms) sends to ask a process to stop, before escalating to
+`SIGKILL` if it doesn't — is to terminate immediately. Every request the
+process happens to be in the middle of handling at that exact moment is cut
+off mid-flight, and the database connection is torn down uncleanly rather
+than closed. This function makes shutdown a deliberate, ordered sequence
+instead:
+
+- `shuttingDown` guards against handling the same shutdown twice — `SIGTERM`
+  and `SIGINT` could both arrive (or the same signal twice, from an
+  impatient `Ctrl+C`), and re-entering this logic a second time while the
+  first call is still in flight would be at best redundant, at worst race
+  the first call's own cleanup.
+- `server.close(callback)` — tells the HTTP server to stop accepting *new*
+  connections, but **its callback only fires once every in-flight request
+  has finished** — that's the actual mechanism behind "graceful": no request
+  gets cut off, the process just stops handing out new ones.
+- Only once `close` completes does it `await prisma.$disconnect()` —
+  closing the database connection pool cleanly, rather than however it would
+  end up if the process just vanished mid-query.
+- `process.exit(closeErr ? 1 : 0)` — a clean exit code signals to whatever's
+  supervising this process (systemd, Kubernetes, …) whether shutdown
+  actually succeeded.
+- The `setTimeout(..., 10_000).unref()` is a backstop for the one case the
+  graceful path doesn't handle on its own: something (a request stuck
+  waiting on a hung downstream call, say) keeps `server.close`'s callback
+  from ever firing. Without this, the process would simply hang forever
+  instead of eventually exiting. `.unref()` tells Node not to let this timer
+  by itself keep the process alive — if everything else finishes cleanly
+  first, this timer doesn't block the process from exiting on its own.
 
 ---
 
@@ -1481,7 +1773,12 @@ Confirms: sign→verify round-trips to the exact original payload; a token
 signed with a *different* secret is rejected (proves signature checking
 actually works, not just structural parsing); an already-expired token is
 rejected with the specific `TokenExpiredError`; a token missing the `email`
-claim is rejected even though its signature is otherwise valid.
+claim is rejected even though its signature is otherwise valid; and two
+regression tests for `issuer`/`audience` (§7) — a correctly-signed token
+with the *wrong* `audience`, and separately one with the wrong `issuer`, are
+both rejected even though nothing else about them is invalid, proving
+`verifyAccessToken` actually enforces those claims rather than merely
+accepting whatever (or no) value shows up.
 
 ### `tests/unit/token.service.test.ts`
 The most involved test file, matching the most involved source file:
@@ -1548,7 +1845,73 @@ still have passed a test asserting the *result*, so this explicitly checks
 the call count too); matching email + verified → linked via `update`;
 matching email + **not** verified → rejected, `update` never called (the
 account-takeover guard, explicitly tested); no match at all → `create`
-called with `passwordHash: null`.
+called with `passwordHash: null`. Two more tests mirror the pair in
+`auth.service.test.ts` for the concurrent-signup race (§11): `create`
+mocked to reject with a real `P2002` error, `findFirst` mocked to return a
+"winner" on its *second* call (the re-fetch after losing the race) —
+asserts the function returns that winner rather than throwing, and that
+`findFirst` really was called exactly twice; a companion test confirms an
+unrelated `Error` from `create` is re-thrown as-is, not misreported as a race.
+
+### `tests/unit/validate.middleware.test.ts`
+Didn't exist before this round of fixes. Confirms the core behavior (an
+invalid body → `400` `AppError`; a valid body → `req.body` replaced with
+zod's parsed/transformed output, e.g. a trimmed+lowercased email) and,
+specifically, the query/params write-back fix (§15): a custom schema that
+validates `query` (with a `z.coerce.number()` field) has its *parsed*
+`req.query` — not the raw request's — visible to whatever runs next; a
+schema that only defines `body` leaves `req.query` completely untouched
+(asserted via `toBe`, object identity, not just `toEqual`) — proving the
+new write-back code doesn't overwrite `req.query` with `undefined` when a
+schema simply has nothing to say about it.
+
+### `tests/unit/error.middleware.test.ts`
+Also didn't exist before this round. Confirms: an `AppError` passes its
+`statusCode`/message through unchanged; a hand-built object shaped exactly
+like what body-parser actually throws (`Error` + `.statusCode` + `.expose:
+true`, §14) is translated to its real status and message — the regression
+test for the body-size-limit/malformed-JSON fix; a same-shaped error but
+with `expose: false` is *not* treated the same way — falls back to the
+generic `500`, proving `asExposedHttpError` respects that flag rather than
+just checking "does this have a `statusCode`"; a plain unexpected `Error` (a
+deliberately sensitive message) results in a `500` whose response body does
+**not** contain that message, confirming nothing unexpected ever leaks to
+the client; and a thrown non-`Error` value (a plain string) is also handled
+without crashing the handler itself.
+
+### `tests/integration/rateLimit.test.ts`
+A dedicated file, not folded into `auth.routes.test.ts` — deliberately, so
+it gets its own fresh module registry and therefore fresh, unused
+`strictAuthRateLimiter`/`standardAuthRateLimiter` counters (§16), unaffected
+by any earlier test in a shared file having already spent part of either
+budget. This is the direct regression test for the shared-rate-limit-budget
+bug: drives 31 requests into `/login` — one past `RATE_LIMIT_STRICT_MAX`'s
+default of 30 — confirms the last one gets `429`, then makes a *single*
+request to `/refresh` and asserts it comes back `401` (a real, normal
+response), not `429`. An earlier version of the rate limiter, reused across
+every route, would have failed that last assertion — `/refresh` would have
+inherited `/login`'s exhausted budget.
+
+### `tests/unit/corsConfig.test.ts`
+The one file in this suite that needs true module-level isolation to test
+at all, because `env.ts` parses `process.env` exactly once, at import time
+— proving "this exact `process.env` produces this exact behavior" means
+starting from a genuinely fresh module registry per case
+(`jest.isolateModules(...)`), not just reassigning `process.env` after
+`env.ts` has already run once and cached its answer. Two groups:
+- **`ALLOW_ANY_CORS_ORIGIN` parsing** — `"false"` parses to real `false`
+  (the direct regression test for the `z.coerce.boolean()` footgun
+  described in §3 — asserted with `toBe(false)`, not a looser truthy check,
+  specifically because the bug this guards against would make it `true`);
+  `"true"` parses to `true`; unset defaults to `false`; a nonsense value
+  (`"yes-please"`) is rejected outright rather than silently defaulting.
+- **CORS actually stays closed** — the scenario from the originally reported
+  bug, reproduced directly: `NODE_ENV` entirely unset, no `CORS_ALLOWED_ORIGINS`,
+  no `ALLOW_ANY_CORS_ORIGIN` → a real preflight `OPTIONS` request against a
+  freshly-built app has **no** `Access-Control-Allow-Origin` header at all.
+  A second test confirms the escape hatch itself works: the same setup with
+  `ALLOW_ANY_CORS_ORIGIN=true` gets the header, reflecting the request's
+  origin.
 
 ### `tests/unit/auth.middleware.test.ts`
 Builds fake Express `req`/`res`/`next` objects by hand (no need for a real
@@ -1576,9 +1939,11 @@ response; `POST /auth/google/exchange` → an unknown code rejected with
 `400`, and a code obtained by calling `createHandoff` directly (standing in
 for what `googleCallback` would have done) successfully exchanged once and
 rejected the second time it's tried — proving the single-use property holds
-through the actual route, not just the service function in isolation; any
-unrecognized route → a clean `404` JSON error (proving `notFoundHandler` is
-wired in correctly).
+through the actual route, not just the service function in isolation; a
+body over `JSON_BODY_LIMIT` → `413`, and malformed JSON → `400` — both the
+direct regression test for the `error.middleware.ts` fix (§14): before that
+fix, both of these came back a generic `500`; any unrecognized route → a
+clean `404` JSON error (proving `notFoundHandler` is wired in correctly).
 
 ---
 
@@ -1587,11 +1952,15 @@ wired in correctly).
 To tie it all together, here's literally everything that happens for one
 `POST /api/auth/signup` call, in order:
 
-1. `server.ts`'s `app.listen(...)` has an Express app (`app.ts`) listening.
+1. `server.ts`'s `app.listen(...)` has an Express app (`app.ts`) listening
+   (with `trust proxy` set first, if `TRUST_PROXY` is configured).
 2. Request hits `helmet()` → `cors({ origin: corsOrigin() })` →
-   `express.json()` (parses the JSON body into `req.body`) → `cookieParser()`.
+   `express.json({ limit: env.JSON_BODY_LIMIT })` (parses the JSON body into
+   `req.body`, or throws a `413`/`400` for an oversized/malformed one — see
+   `error.middleware.ts`, §14) → `cookieParser()`.
 3. Express matches `/api/auth/*` → into `auth.routes.ts`.
-4. `authRateLimiter` — allowed to proceed (under the limit).
+4. `strictAuthRateLimiter` — allowed to proceed (under its own, separate
+   budget from `refresh`/`logout`/`google/exchange`'s `standardAuthRateLimiter`).
 5. `validate(signupSchema)` — checks `req.body.{email,password,name}`
    (password length now bounded on both ends, 8–72); if invalid, responds
    `400` immediately and nothing further runs.

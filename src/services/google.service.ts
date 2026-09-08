@@ -1,4 +1,5 @@
 import { OAuth2Client } from 'google-auth-library';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { env } from '../config/env';
 import { AppError } from '../utils/AppError';
@@ -102,15 +103,40 @@ export async function findOrCreateGoogleUser(profile: GoogleProfile) {
     });
   }
 
-  return prisma.user.create({
-    data: {
-      email: profile.email,
-      googleId: profile.googleId,
-      name: profile.name,
-      isEmailVerified: profile.emailVerified,
-      passwordHash: null,
-    },
-  });
+  // Same TOCTOU shape as auth.service.ts's signup() (see EXPLANATION.md §10):
+  // the findFirst above is a fast-path check, not a guard — two Google
+  // logins for the same brand-new account arriving close together (a
+  // double-click on "Continue with Google", or two tabs) can both see "no
+  // existing user" and both reach this create(). Only one INSERT can
+  // actually win against the `email`/`googleId` unique constraints; without
+  // this catch, the loser would throw a raw, unhandled
+  // PrismaClientKnownRequestError straight into errorHandler's generic `500`
+  // branch, on what is, from the user's perspective, a successful login.
+  try {
+    return await prisma.user.create({
+      data: {
+        email: profile.email,
+        googleId: profile.googleId,
+        name: profile.name,
+        isEmailVerified: profile.emailVerified,
+        passwordHash: null,
+      },
+    });
+  } catch (err) {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+      // Lost the race — the concurrent request that won it already created
+      // (or linked) the row we were about to create. Fetch and return that
+      // instead of failing a login that, functionally, just succeeded
+      // via the other request.
+      const winner = await prisma.user.findFirst({
+        where: { OR: [{ googleId: profile.googleId }, { email: profile.email }] },
+      });
+      if (winner) {
+        return winner;
+      }
+    }
+    throw err;
+  }
 }
 
 export interface GoogleLoginResult {

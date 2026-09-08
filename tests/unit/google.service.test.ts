@@ -1,4 +1,4 @@
-import type { User } from '@prisma/client';
+import { Prisma, type User } from '@prisma/client';
 import { prismaMock } from '../mocks/prisma.mock';
 import { findOrCreateGoogleUser } from '../../src/services/google.service';
 import { AppError } from '../../src/utils/AppError';
@@ -79,5 +79,34 @@ describe('google.service findOrCreateGoogleUser', () => {
         }),
       }),
     );
+  });
+
+  it('closes the concurrent-Google-signup race: a P2002 from create() resolves to the winner, not a crash', async () => {
+    // Simulates two simultaneous Google logins for the same brand-new
+    // account: this call's findFirst still sees no existing user (the other
+    // caller hasn't committed yet), so it proceeds to create() — which is
+    // where the real `email`/`googleId` unique constraints catch it.
+    const winner = buildUser({ googleId: profile.googleId, passwordHash: null });
+    prismaMock.user.findFirst
+      .mockResolvedValueOnce(null) // initial lookup: no match yet
+      .mockResolvedValueOnce(winner); // re-fetch after losing the create() race
+    prismaMock.user.create.mockRejectedValue(
+      new Prisma.PrismaClientKnownRequestError('Unique constraint failed on the fields: (`email`)', {
+        code: 'P2002',
+        clientVersion: '5.22.0',
+      }),
+    );
+
+    const result = await findOrCreateGoogleUser(profile);
+
+    expect(result).toBe(winner);
+    expect(prismaMock.user.findFirst).toHaveBeenCalledTimes(2);
+  });
+
+  it('re-throws an unrelated database error from create() rather than misreporting it as a race', async () => {
+    prismaMock.user.findFirst.mockResolvedValue(null);
+    prismaMock.user.create.mockRejectedValue(new Error('connection reset'));
+
+    await expect(findOrCreateGoogleUser(profile)).rejects.toThrow('connection reset');
   });
 });

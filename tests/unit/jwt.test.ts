@@ -29,4 +29,23 @@ describe('jwt utils', () => {
     );
     expect(() => verifyAccessToken(incompleteToken)).toThrow(jwt.JsonWebTokenError);
   });
+
+  it('throws on a correctly-signed token issued for a different audience', () => {
+    // Same secret, same payload shape — the only thing wrong is `aud`.
+    // Confirms verifyAccessToken actually enforces JWT_AUDIENCE rather than
+    // just tolerating whatever value (or none) shows up.
+    const wrongAudienceToken = jwt.sign(payload, process.env.JWT_ACCESS_SECRET as string, {
+      issuer: process.env.JWT_ISSUER || 'auth-service',
+      audience: 'some-other-app',
+    });
+    expect(() => verifyAccessToken(wrongAudienceToken)).toThrow(jwt.JsonWebTokenError);
+  });
+
+  it('throws on a correctly-signed token issued by a different issuer', () => {
+    const wrongIssuerToken = jwt.sign(payload, process.env.JWT_ACCESS_SECRET as string, {
+      issuer: 'some-other-service',
+      audience: process.env.JWT_AUDIENCE || 'auth-service',
+    });
+    expect(() => verifyAccessToken(wrongIssuerToken)).toThrow(jwt.JsonWebTokenError);
+  });
 });

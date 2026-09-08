@@ -146,6 +146,26 @@ describe('POST /api/auth/google/exchange', () => {
   });
 });
 
+describe('request body edge cases', () => {
+  it('rejects a body over JSON_BODY_LIMIT with 413, not a generic 500', async () => {
+    const res = await request(app)
+      .post('/api/auth/signup')
+      .send({ email: 'jane@example.com', password: 'password123', name: 'x'.repeat(20_000) });
+
+    expect(res.status).toBe(413);
+    expect(res.body.error.message).toBeTruthy();
+  });
+
+  it('rejects malformed JSON with 400, not a generic 500', async () => {
+    const res = await request(app)
+      .post('/api/auth/signup')
+      .set('Content-Type', 'application/json')
+      .send('{not valid json');
+
+    expect(res.status).toBe(400);
+  });
+});
+
 describe('unknown route', () => {
   it('returns a 404 JSON error', async () => {
     const res = await request(app).get('/api/does-not-exist');

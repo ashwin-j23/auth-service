@@ -13,15 +13,23 @@ export function signAccessToken(payload: AccessTokenPayload): string {
     // (src/config/env.ts) to be a value jwt.sign accepts (e.g. "15m"), so
     // this cast is safe.
     expiresIn: env.JWT_ACCESS_TTL as jwt.SignOptions['expiresIn'],
+    issuer: env.JWT_ISSUER,
+    audience: env.JWT_AUDIENCE,
   });
 }
 
 /**
  * Throws jwt.JsonWebTokenError / jwt.TokenExpiredError on an invalid or
  * expired token — callers should catch and translate to an AppError(401).
+ * Requires (not just tolerates) a matching `iss`/`aud` — a token that's
+ * otherwise validly signed but issued for a different audience is rejected
+ * exactly like a bad signature, not silently accepted.
  */
 export function verifyAccessToken(token: string): AccessTokenPayload {
-  const decoded = jwt.verify(token, env.JWT_ACCESS_SECRET);
+  const decoded = jwt.verify(token, env.JWT_ACCESS_SECRET, {
+    issuer: env.JWT_ISSUER,
+    audience: env.JWT_AUDIENCE,
+  });
   if (typeof decoded === 'string' || !decoded.sub || !decoded.email) {
     throw new jwt.JsonWebTokenError('Malformed access token payload');
   }

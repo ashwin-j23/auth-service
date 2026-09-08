@@ -27,6 +27,12 @@ interface HandoffEntry {
 }
 
 const HANDOFF_TTL_MS = 60 * 1000; // must be exchanged within 1 minute
+// A defensive cap, not an expected operating point: purgeExpired() below
+// keeps normal usage far under this even during a heavy burst of logins
+// (each entry only lives ~60s), but bounding store.size means a sustained
+// flood of Google logins within a single TTL window — whatever the cause —
+// can't grow this map without bound in a long-running process.
+const MAX_HANDOFF_ENTRIES = 1000;
 const store = new Map<string, HandoffEntry>();
 
 function purgeExpired(): void {
@@ -39,6 +45,15 @@ function purgeExpired(): void {
 /** Stashes a login result behind a fresh opaque code and returns that code. */
 export function createHandoff(user: PublicUser, tokens: TokenPair): string {
   purgeExpired();
+  if (store.size >= MAX_HANDOFF_ENTRIES) {
+    // Still over the cap after purging expired entries — evict the oldest
+    // one. Map iteration order is insertion order, so the first key from
+    // the iterator is the oldest surviving entry.
+    const oldestKey = store.keys().next().value;
+    if (oldestKey !== undefined) {
+      store.delete(oldestKey);
+    }
+  }
   const code = crypto.randomBytes(24).toString('hex');
   store.set(code, { user, tokens, expiresAt: Date.now() + HANDOFF_TTL_MS });
   return code;
