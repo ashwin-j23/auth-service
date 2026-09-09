@@ -34,8 +34,16 @@ jobs:
       # `npm ci`, not `npm install` — installs exactly what's in
       # package-lock.json, and fails outright if the lockfile and
       # package.json have drifted, instead of silently re-resolving.
+      #
+      # `--ignore-scripts`: a build pipeline has no reason to trust every
+      # dependency's (and sub-dependency's) install/postinstall hooks to
+      # run arbitrary code unreviewed — that's a real supply-chain-attack
+      # surface, not just a lint nag. Safe here specifically because the
+      # one thing in this tree that a postinstall hook would normally do
+      # for us (@prisma/client auto-running `prisma generate` after
+      # install) is already its own explicit step below regardless.
       - name: Install dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       # The Prisma client is generated from prisma/schema.prisma into
       # node_modules/@prisma/client — required before tsc or jest can even
@@ -43,11 +51,19 @@ jobs:
       # (unit tests replace `prisma` with a deep mock — see
       # tests/mocks/prisma.mock.ts — so no Postgres service container is
       # needed here at all).
+      #
+      # `npm run prisma:generate`, not `npx prisma generate`: npm run only
+      # ever executes the LOCAL binary npm ci just installed into
+      # node_modules/.bin — it fails if that binary is missing rather than
+      # falling back to fetching and running some arbitrary version of the
+      # package on the spot, which is exactly what a bare `npx <package>`
+      # invocation can do. Same reasoning for `npm run lint:types` below,
+      # in place of `npx tsc --noEmit`.
       - name: Generate Prisma client
-        run: npx prisma generate
+        run: npm run prisma:generate
 
       - name: Type-check
-        run: npx tsc --noEmit
+        run: npm run lint:types
 
       - name: Test
         run: npm test
