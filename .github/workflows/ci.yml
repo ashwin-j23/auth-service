@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        # Node 20 is the floor (nodemailer 10 requires it — see package.json's
+        # "engines"); 22 is the current LTS. 18 is dropped — it went EOL in
+        # April 2025, so it's no longer a realistic target and setup-node
+        # flags it as deprecated.
+        node-version: [20.x, 22.x]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: "npm"
+
+      # `npm ci`, not `npm install` — installs exactly what's in
+      # package-lock.json, and fails outright if the lockfile and
+      # package.json have drifted, instead of silently re-resolving.
+      - name: Install dependencies
+        run: npm ci
+
+      # The Prisma client is generated from prisma/schema.prisma into
+      # node_modules/@prisma/client — required before tsc or jest can even
+      # import it. This only needs the schema file, not a live database
+      # (unit tests replace `prisma` with a deep mock — see
+      # tests/mocks/prisma.mock.ts — so no Postgres service container is
+      # needed here at all).
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: npm test

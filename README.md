@@ -7,7 +7,8 @@ For a full line-by-line explanation of every file, see **[EXPLANATION.md](./EXPL
 
 ## Stack
 
-- Node.js + TypeScript + Express
+- Node.js (>= 20 — see `package.json`'s `engines`; `nodemailer` 10 requires it) + TypeScript + Express
+- `tsx` for the local dev server (`npm run dev`), auto-restarting on file changes
 - PostgreSQL + [Prisma](https://www.prisma.io/) (schema + migrations + typed client)
 - JWT access tokens (`jsonwebtoken`) + opaque, rotated, hashed refresh tokens
 - `bcryptjs` for password hashing
@@ -77,6 +78,26 @@ repeated across several fix iterations, until the account reliably ends
 up locked with a plausible attempt count every time instead of
 intermittently unlocked with an under-count. See the session transcript
 linked in the commit if you want the raw output.
+
+## CI
+
+`.github/workflows/ci.yml` runs on every push/PR to `main`: `npm ci`, `npx
+prisma generate`, `npx tsc --noEmit`, then `npm test` — on Node 20.x and
+22.x (18.x is dropped; it went EOL in April 2025). No database service
+container or secrets are needed: `prisma generate` only reads
+`prisma/schema.prisma` (no live connection), and every env var the app
+needs is already seeded by `tests/setup.ts` before the suite runs.
+
+This replaces two earlier workflow files (a "Deno" workflow and a "NodeJS
+with Webpack" one) that were GitHub's generic starter templates, added
+as-is without adapting them to this project — this is a Node/Express/Jest
+app with no Deno code and no webpack config or dependency, so both failed
+on every run for reasons that had nothing to do with the actual code:
+`deno test` can't resolve this project's npm-style imports (`@prisma/client`,
+Jest globals, ...) and exits within a few seconds of trying, and `npx
+webpack` with neither webpack nor a config installed drops into npm's
+"install this for me? (yes/no)" prompt, which has no terminal to answer it
+in CI and fails immediately.
 
 ## API
 
@@ -203,6 +224,20 @@ about before shipping this as-is:
   original pin had three known CVEs (a stack-overflow DoS, a
   disableFileAccess/disableUrlAccess bypass, and a quadratic-time address
   parser), all fixed by `9.1.0`.
+- **`npm audit` is clean (0 vulnerabilities)** via `package.json`'s
+  `overrides` — `qs` (pulled in below the patched version by `express`
+  itself; there's no 4.x `express` release that resolves a fixed `qs`, only
+  5.x, a breaking major this project isn't taking on for this alone) and
+  `uuid` (pulled in below the patched version by `google-auth-library` →
+  `gaxios`) are both forced to a safe minimum this way instead. `jest` was
+  also bumped to 30.x (with a matching `jest-mock-extended` 4.x and
+  `@types/jest` 30.x) specifically to drop the `rimraf`/`glob`/`inflight`
+  chain the old `ts-node-dev` dev dependency and jest 29's own internals
+  were pulling in; `ts-node-dev` itself was replaced with `tsx` (see
+  `npm run dev`) for the same reason. One deprecation warning remains —
+  `lodash.isequal`, a direct dependency of `jest-mock-extended` itself —
+  and needs an upstream release to clear; there's nothing to override it
+  to.
 - **Access/refresh tokens are returned in the JSON response body, not as
   `httpOnly` cookies** — a deliberate architectural choice, not an
   oversight, but one worth stating explicitly rather than leaving implicit:
