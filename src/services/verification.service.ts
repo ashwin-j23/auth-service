@@ -1,4 +1,4 @@
-import crypto from 'crypto';
+import crypto from 'node:crypto';
 import { Prisma, VerificationPurpose } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { env } from '../config/env';

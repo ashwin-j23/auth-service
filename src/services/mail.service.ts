@@ -18,33 +18,40 @@ import { env } from '../config/env';
 let transporterPromise: Promise<Transporter> | undefined;
 
 async function getTransporter(): Promise<Transporter> {
-  if (!transporterPromise) {
-    transporterPromise = (async () => {
-      if (env.ETHEREAL_SMTP_USER && env.ETHEREAL_SMTP_PASS) {
-        // A pinned account, set explicitly — reused across restarts instead
-        // of minting a fresh throwaway one every time the process starts.
-        return nodemailer.createTransport({
-          host: 'smtp.ethereal.email',
-          port: 587,
-          secure: false,
-          auth: { user: env.ETHEREAL_SMTP_USER, pass: env.ETHEREAL_SMTP_PASS },
-        });
-      }
-      const testAccount = await nodemailer.createTestAccount();
-      // eslint-disable-next-line no-console
-      console.log(
-        `mail.service: minted a fresh Ethereal test account (${testAccount.user}) — ` +
-          'set ETHEREAL_SMTP_USER/ETHEREAL_SMTP_PASS to reuse one instead of a new ' +
-          'throwaway account on every restart.',
-      );
+  transporterPromise ??= (async () => {
+    if (env.ETHEREAL_SMTP_USER && env.ETHEREAL_SMTP_PASS) {
+      // A pinned account, set explicitly — reused across restarts instead
+      // of minting a fresh throwaway one every time the process starts.
       return nodemailer.createTransport({
-        host: testAccount.smtp.host,
-        port: testAccount.smtp.port,
-        secure: testAccount.smtp.secure,
-        auth: { user: testAccount.user, pass: testAccount.pass },
+        host: 'smtp.ethereal.email',
+        port: 587,
+        secure: false,
+        // `secure: false` + port 587 is STARTTLS, not clear-text SMTP — but
+        // without `requireTLS`, nodemailer silently falls back to sending
+        // in the clear if the server ever fails to offer STARTTLS, which is
+        // indistinguishable from "insecure by configuration" from the
+        // outside (and is exactly what static analysis flags this
+        // `secure: false` shape as). Setting it explicitly makes the
+        // connection refuse to send rather than silently downgrade.
+        requireTLS: true,
+        auth: { user: env.ETHEREAL_SMTP_USER, pass: env.ETHEREAL_SMTP_PASS },
       });
-    })();
-  }
+    }
+    const testAccount = await nodemailer.createTestAccount();
+    // eslint-disable-next-line no-console
+    console.log(
+      `mail.service: minted a fresh Ethereal test account (${testAccount.user}) — ` +
+        'set ETHEREAL_SMTP_USER/ETHEREAL_SMTP_PASS to reuse one instead of a new ' +
+        'throwaway account on every restart.',
+    );
+    return nodemailer.createTransport({
+      host: testAccount.smtp.host,
+      port: testAccount.smtp.port,
+      secure: testAccount.smtp.secure,
+      requireTLS: !testAccount.smtp.secure,
+      auth: { user: testAccount.user, pass: testAccount.pass },
+    });
+  })();
   return transporterPromise;
 }
 
