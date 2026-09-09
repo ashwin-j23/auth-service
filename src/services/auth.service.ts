@@ -26,6 +26,24 @@ export interface AuthResult {
   tokens: TokenPair;
 }
 
+// Bcrypt-compared (result discarded) against every login attempt for an
+// email that doesn't exist, or exists but has no password set (a Google-only
+// account) — see login() below. Computed once, lazily, the same way a real
+// user's hash would be: this is NOT a hardcoded literal precisely so it goes
+// through the exact same bcrypt cost factor as every genuine hash in this
+// database (src/utils/password.ts's SALT_ROUNDS), rather than risking silent
+// drift if that constant is ever tuned.
+//
+// Without this, login() used to return its generic 401 immediately for those
+// two cases — no bcrypt call at all — while a real "wrong password" attempt
+// against an existing account pays bcrypt's ~50-100ms cost first. That
+// timing gap is a textbook account-enumeration side channel: an attacker
+// can't read the (identical) response body to tell "unregistered email" from
+// "wrong password", but they can just measure how long the response took.
+// Running the same comparison against a decoy hash on the fast path closes
+// that gap without changing anything the caller-visible response says.
+const dummyPasswordHash = hashPassword('timing-attack-mitigation-decoy-password');
+
 export async function signup(input: SignupInput): Promise<AuthResult> {
   const email = normalizeEmail(input.email);
 
@@ -85,6 +103,9 @@ export async function login(input: LoginInput): Promise<AuthResult> {
     // No account, or a Google-only account — either way there's no password
     // to guess against and no row to track failed attempts on, so lockout
     // doesn't apply; this is the same "nothing to do" case it always was.
+    // The bcrypt compare against a decoy hash below is pure timing cover
+    // (see dummyPasswordHash above) — its result is never inspected.
+    await comparePassword(input.password, await dummyPasswordHash);
     throw invalidCredentials();
   }
 

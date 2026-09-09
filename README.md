@@ -91,12 +91,21 @@ Signup/login/refresh responses look like:
 
 `POST /api/auth/google/exchange` returns the same shape. The Google flow is
 three hops, not two: `GET /auth/google` → Google's consent screen → `GET
-/auth/google/callback` (server-side; verifies the OAuth `state`, creates/links
-the user, then redirects the browser to `OAUTH_SUCCESS_REDIRECT_URL?code=<handoffCode>`)
+/auth/google/callback` (server-side; verifies the OAuth `state`, the PKCE
+`code_verifier`, and the OIDC `nonce`, creates/links the user, then redirects
+the browser to `OAUTH_SUCCESS_REDIRECT_URL?code=<handoffCode>`)
 → the frontend immediately calls `POST /auth/google/exchange` with that `code`
 to get the real `user`/`tokens`. The handoff code is single-use and expires
 after 60 seconds — it exists purely so the real tokens never appear in a URL
 (see EXPLANATION.md for why that matters).
+
+`GET /auth/google` generates `state` (CSRF), a PKCE `code_verifier`/
+`code_challenge` pair (RFC 7636), and an OIDC `nonce`, all bundled into one
+short-lived signed cookie. `code_challenge`/`code_challenge_method=S256` go to
+Google up front; `code_verifier` is sent back at token-exchange time so Google
+can confirm the two match (closing authorization-code interception), and the
+`nonce` is checked against the claim Google's ID token echoes back (closing ID
+token replay from a different flow).
 
 ## Security notes / production hardening ideas
 
