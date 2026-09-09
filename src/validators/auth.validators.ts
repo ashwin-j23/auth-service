@@ -41,7 +41,42 @@ export const googleExchangeSchema = z.object({
   }),
 });
 
+export const requestEmailVerificationSchema = z.object({
+  body: z.object({
+    email: z.string().trim().email('Must be a valid email address'),
+  }),
+});
+
+export const confirmEmailVerificationSchema = z.object({
+  body: z.object({
+    token: z.string().min(1, 'token is required'),
+  }),
+});
+
+export const requestPasswordResetSchema = z.object({
+  body: z.object({
+    email: z.string().trim().email('Must be a valid email address'),
+  }),
+});
+
+// Same length bounds as signupSchema's password field, and for the same
+// reason (bcrypt's 72-byte truncation — see the comment there); a reset
+// password goes through the exact same hashPassword() call.
+export const confirmPasswordResetSchema = z.object({
+  body: z.object({
+    token: z.string().min(1, 'token is required'),
+    password: z
+      .string()
+      .min(8, 'Password must be at least 8 characters long')
+      .max(72, 'Password must be at most 72 characters long'),
+  }),
+});
+
 export type SignupBody = z.infer<typeof signupSchema>['body'];
 export type LoginBody = z.infer<typeof loginSchema>['body'];
 export type RefreshBody = z.infer<typeof refreshSchema>['body'];
 export type GoogleExchangeBody = z.infer<typeof googleExchangeSchema>['body'];
+export type RequestEmailVerificationBody = z.infer<typeof requestEmailVerificationSchema>['body'];
+export type ConfirmEmailVerificationBody = z.infer<typeof confirmEmailVerificationSchema>['body'];
+export type RequestPasswordResetBody = z.infer<typeof requestPasswordResetSchema>['body'];
+export type ConfirmPasswordResetBody = z.infer<typeof confirmPasswordResetSchema>['body'];

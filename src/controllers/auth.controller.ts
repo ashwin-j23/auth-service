@@ -85,21 +85,39 @@ function generatePkcePair(): { codeVerifier: string; codeChallenge: string } {
 }
 
 /**
+ * Thrown specifically for the "user clicked Cancel on Google's consent
+ * screen" case, so googleCallback can tell it apart from every other
+ * failure and redirect the browser back to the frontend instead of dead-
+ * ending it on a raw JSON error — see the comment at its one call site.
+ */
+class OAuthConsentDeniedError extends Error {}
+
+/**
  * Checks the `code`/`state` query params against the signed state cookie.
  * Pure — no response mutation here on purpose (see googleCallback): a CSRF
  * state token should be validated *before* it's consumed/cleared, the same
  * "burn after a single successful use" pattern as a refresh token (§9) or a
  * handoff code (oauthHandoff.service.ts) — not cleared as an incidental
  * first step regardless of whether this request turns out to be legitimate.
- * Throws AppError(400) for anything invalid; returns the validated `code`
- * plus the `nonce`/`codeVerifier` this same flow generated, for the caller to
- * pass on to the token exchange.
+ * Throws OAuthConsentDeniedError if the user denied consent, AppError(400)
+ * for anything else invalid; otherwise returns the validated `code` plus the
+ * `nonce`/`codeVerifier` this same flow generated, for the caller to pass on
+ * to the token exchange.
  */
 function validateOAuthCallback(
   query: Request['query'],
   cookiePayload: OAuthCookiePayload | undefined,
 ): { code: string; nonce: string; codeVerifier: string } {
-  const { code, state } = query;
+  const { code, state, error } = query;
+  if (typeof error === 'string') {
+    // Google redirects here with `?error=access_denied&state=...` (no
+    // `code` at all) when the user clicks "Cancel" on the consent screen —
+    // an easily-hit, completely normal part of this flow (anyone who's ever
+    // demoed it has hit Cancel by accident at least once), not a failure
+    // worth a raw API error page. Checked before the generic "missing code"
+    // case below specifically so this doesn't fall through into it.
+    throw new OAuthConsentDeniedError(error);
+  }
   if (typeof code !== 'string') {
     throw new AppError(400, 'Missing authorization code');
   }
@@ -200,16 +218,37 @@ export async function googleCallback(req: Request, res: Response, next: NextFunc
     // response mutation; performing it before the request has even been
     // checked means an invalid/forged callback still gets to consume (and
     // therefore invalidate) the real, legitimate state cookie for whatever
-    // OAuth attempt is actually still in flight in this browser. Wrapping
-    // just the validation in its own try/finally keeps the clear tied to
-    // "we attempted to consume this state" without smearing it earlier than
-    // that across the function.
+    // OAuth attempt is actually still in flight in this browser.
+    //
+    // NOT a try/finally: `finally` runs even after a `return` inside the
+    // `catch` below, which — for the consent-denied branch — is AFTER
+    // `res.redirect()` has already sent the response. Calling
+    // `res.clearCookie()` (which sets a header) past that point throws
+    // ERR_HTTP_HEADERS_SENT instead of clearing anything. Clearing the
+    // cookie explicitly on every path below, always before that path's own
+    // response goes out, avoids that.
     let code: string, nonce: string, codeVerifier: string;
     try {
       ({ code, nonce, codeVerifier } = validateOAuthCallback(req.query, cookiePayload));
-    } finally {
+    } catch (err) {
       res.clearCookie(OAUTH_STATE_COOKIE, OAUTH_STATE_COOKIE_OPTIONS);
+      if (err instanceof OAuthConsentDeniedError) {
+        // Every OTHER error path in this controller either redirects the
+        // browser somewhere sensible or returns a clean JSON error — this
+        // is the one case that used to just dead-end on a raw 400 mid-flow.
+        // Send the browser back to the frontend with an indicator in the
+        // query string instead, the same "redirect back, don't just fail
+        // the API call" shape as a successful callback (see the handoff
+        // redirect below), so the frontend can show its own "you cancelled
+        // sign-in" state rather than a bare API error page.
+        const redirectUrl = new URL(env.OAUTH_SUCCESS_REDIRECT_URL);
+        redirectUrl.searchParams.set('error', 'google_consent_denied');
+        res.redirect(redirectUrl.toString());
+        return;
+      }
+      throw err;
     }
+    res.clearCookie(OAUTH_STATE_COOKIE, OAUTH_STATE_COOKIE_OPTIONS);
 
     const { user, tokens } = await googleService.loginWithGoogleCode(code, codeVerifier, nonce);
 
@@ -241,6 +280,64 @@ export async function googleExchange(req: Request, res: Response, next: NextFunc
       throw new AppError(400, 'Invalid, expired, or already-used exchange code');
     }
     res.status(200).json(result);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// Every response below is deliberately the exact same shape whether or not
+// anything actually happened server-side (an account existed, an email was
+// already verified, a token was genuinely sent) — see the enumeration-
+// resistance comments on authService.requestEmailVerification/
+// requestPasswordReset. Only the *confirm* endpoints, which require
+// possessing a specific high-entropy token rather than just guessing an
+// email address, can afford to be specific about failure.
+
+/** POST /auth/email/verify — sends (or resends) an email-verification link. */
+export async function requestEmailVerification(req: Request, res: Response, next: NextFunction) {
+  try {
+    await authService.requestEmailVerification(req.body.email);
+    res.status(200).json({
+      message: 'If that email exists and is not yet verified, a verification link has been sent.',
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** POST /auth/email/verify/confirm — consumes the token from that link. */
+export async function confirmEmailVerification(req: Request, res: Response, next: NextFunction) {
+  try {
+    await authService.confirmEmailVerification(req.body.token);
+    res.status(200).json({ message: 'Email verified.' });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** POST /auth/password/reset — sends a password-reset link. */
+export async function requestPasswordReset(req: Request, res: Response, next: NextFunction) {
+  try {
+    await authService.requestPasswordReset(req.body.email);
+    res
+      .status(200)
+      .json({ message: 'If an account exists for that email, a password reset link has been sent.' });
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * POST /auth/password/reset/confirm — consumes the token from that link and
+ * sets a new password. Every existing session on the account is revoked as
+ * part of this (see authService.confirmPasswordReset), so the response
+ * deliberately doesn't hand back a fresh token pair — the client is
+ * expected to log in again with the new password.
+ */
+export async function confirmPasswordReset(req: Request, res: Response, next: NextFunction) {
+  try {
+    await authService.confirmPasswordReset(req.body.token, req.body.password);
+    res.status(200).json({ message: 'Password has been reset. Please log in again.' });
   } catch (err) {
     next(err);
   }

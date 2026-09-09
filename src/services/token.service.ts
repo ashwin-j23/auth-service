@@ -49,12 +49,48 @@ export async function issueTokenPair(user: User): Promise<TokenPair> {
  * used-and-revoked token is replayed — the standard response to a suspected
  * theft signal, since we can't tell "attacker replaying a stolen token" from
  * "legit client retried a request" any other way.
+ *
+ * Exported (not just used internally by rotateRefreshToken below) so
+ * auth.service.ts's confirmPasswordReset can call the exact same mass-revoke
+ * when a password is reset — whoever set the OLD password must not keep a
+ * working session once control of the account changes hands.
  */
-async function revokeAllTokensForUser(userId: string): Promise<void> {
+export async function revokeAllTokensForUser(userId: string): Promise<void> {
   await prisma.refreshToken.updateMany({
     where: { userId, revokedAt: null },
     data: { revokedAt: new Date() },
   });
+}
+
+/**
+ * Logs a detected token-reuse event. This is, on this whole service, the
+ * single most security-relevant thing that can happen — a refresh token
+ * that was already rotated (i.e. already used once) coming back again is
+ * the standard signal that a token was stolen and is being replayed by
+ * someone other than its legitimate holder. Before this, `rotateRefreshToken`
+ * responded correctly (revoking every session) but completely silently: no
+ * log, no alert, nothing — a real compromise could go by with nobody on the
+ * team ever finding out, short of a user complaining about being logged out.
+ *
+ * A plain structured console.error (this project has no logging/alerting
+ * pipeline configured yet — see oauthHandoff.service.ts's store-full log for
+ * the existing precedent) rather than throwing or swallowing: this must not
+ * change the caller's behavior, only make the event observable.
+ */
+function logSuspectedTokenReuse(userId: string, reason: 'already-used' | 'lost-rotation-race'): void {
+  // eslint-disable-next-line no-console
+  console.error(
+    JSON.stringify({
+      level: 'error',
+      event: 'refresh_token_reuse_detected',
+      userId,
+      reason,
+      message:
+        'A refresh token was replayed after being rotated/used — probable token theft. ' +
+        'All sessions for this user have been revoked.',
+      timestamp: new Date().toISOString(),
+    }),
+  );
 }
 
 /**
@@ -73,6 +109,7 @@ export async function rotateRefreshToken(rawRefreshToken: string): Promise<Token
     throw new AppError(401, 'Invalid refresh token');
   }
   if (stored.revokedAt) {
+    logSuspectedTokenReuse(stored.userId, 'already-used');
     await revokeAllTokensForUser(stored.userId);
     throw new AppError(401, 'Refresh token has already been used');
   }
@@ -129,6 +166,7 @@ export async function rotateRefreshToken(rawRefreshToken: string): Promise<Token
   });
 
   if (!rotated) {
+    logSuspectedTokenReuse(stored.userId, 'lost-rotation-race');
     await revokeAllTokensForUser(stored.userId);
     throw new AppError(401, 'Refresh token has already been used');
   }

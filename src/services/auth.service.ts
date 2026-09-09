@@ -1,10 +1,12 @@
-import { Prisma } from '@prisma/client';
+import { Prisma, VerificationPurpose } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { env } from '../config/env';
 import { AppError } from '../utils/AppError';
 import { hashPassword, comparePassword } from '../utils/password';
 import { normalizeEmail } from '../utils/email';
-import { issueTokenPair, type TokenPair } from './token.service';
+import { issueTokenPair, revokeAllTokensForUser, type TokenPair } from './token.service';
+import { createVerificationToken, consumeVerificationToken } from './verification.service';
+import { sendVerificationEmail, sendPasswordResetEmail } from './mail.service';
 import { toPublicUser, type PublicUser } from '../utils/publicUser';
 
 // Prisma's error code for "unique constraint violated" — see signup() below.
@@ -84,6 +86,22 @@ export async function signup(input: SignupInput): Promise<AuthResult> {
   }
 
   const tokens = await issueTokenPair(user);
+
+  // Best-effort — see requestEmailVerification below for the exact same
+  // pattern used on a resend. A failed verification email must never fail
+  // signup itself: the account is fully created and usable either way, and
+  // the user can always request a fresh link later.
+  try {
+    const verificationToken = await createVerificationToken(
+      user.id,
+      VerificationPurpose.EMAIL_VERIFICATION,
+    );
+    await sendVerificationEmail(user.email, verificationToken);
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(`auth.service: failed to send signup verification email for user ${user.id}`, err);
+  }
+
   return { user: toPublicUser(user), tokens };
 }
 
@@ -137,24 +155,50 @@ export async function login(input: LoginInput): Promise<AuthResult> {
     // spreads guesses across many IPs against one specific account; this
     // closes that gap by counting failures on the account itself.
     //
-    // `user.lockedUntil !== null` (checked here, not just "is it still in
-    // the future" — already ruled out above) is the signal an earlier
-    // lockout happened and has since expired: that gets a fresh count
-    // rather than starting permanently pinned at the limit, since without
-    // this a user who once got locked out would re-lock on their very next
-    // mistake, forever, instead of getting a normal-length grace window again.
-    const attemptsBeforeThisOne = user.lockedUntil !== null ? 0 : user.failedLoginAttempts;
-    const attempts = attemptsBeforeThisOne + 1;
-    await prisma.user.update({
+    // `previousLockExpired` (checked here, not just "is it still in the
+    // future" — already ruled out above) is the signal an earlier lockout
+    // happened and has since expired: that gets a fresh count rather than
+    // starting permanently pinned at the limit, since without this a user
+    // who once got locked out would re-lock on their very next mistake,
+    // forever, instead of getting a normal-length grace window again.
+    //
+    // The increment itself uses Prisma's atomic `{ increment: 1 }` — NOT a
+    // value computed in JS from `user.failedLoginAttempts` (the row as read
+    // at the top of this function) and written back. That used to be a real
+    // race: several wrong-password requests fired concurrently (trivial for
+    // an attacker to do) could all read the same starting count before any
+    // of them committed their write, collapsing N failures into the count
+    // advancing by just 1 — silently undermining the one thing this counter
+    // exists to blunt. `{ increment: 1 }` is resolved by Postgres against
+    // the row's actual current value at write time, the same reason
+    // token.service.ts's rotateRefreshToken uses a conditional update
+    // instead of a JS-computed one, so concurrent guesses now correctly
+    // stack instead of colliding.
+    const previousLockExpired = user.lockedUntil !== null;
+    const updated = await prisma.user.update({
       where: { id: user.id },
-      data: {
-        failedLoginAttempts: attempts,
-        lockedUntil:
-          attempts >= env.LOCKOUT_MAX_ATTEMPTS
-            ? new Date(Date.now() + env.LOCKOUT_DURATION_MS)
-            : null,
-      },
+      data: previousLockExpired
+        ? { failedLoginAttempts: 1, lockedUntil: null }
+        : { failedLoginAttempts: { increment: 1 }, lockedUntil: null },
     });
+
+    // The lockout decision is re-derived from `updated.failedLoginAttempts`
+    // — the count Postgres actually returns after the atomic increment
+    // above — not from any value computed earlier in this function, so it
+    // reflects every concurrent failure that landed, not just this one.
+    if (updated.failedLoginAttempts >= env.LOCKOUT_MAX_ATTEMPTS) {
+      // A second, separate write, but it doesn't need to be atomic-with-the
+      // read above to stay correct: every concurrent request past the
+      // threshold computes "lock until" from `env.LOCKOUT_DURATION_MS`
+      // relative to its own `now`, so at worst two racing requests set
+      // `lockedUntil` to two slightly different — but both still correctly
+      // in-the-future — timestamps. Never an inconsistent "should be locked
+      // but isn't" state.
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { lockedUntil: new Date(Date.now() + env.LOCKOUT_DURATION_MS) },
+      });
+    }
     throw invalidCredentials();
   }
 
@@ -170,4 +214,75 @@ export async function login(input: LoginInput): Promise<AuthResult> {
 
   const tokens = await issueTokenPair(user);
   return { user: toPublicUser(user), tokens };
+}
+
+/**
+ * Sends (or resends) an email-verification link. Deliberately silent and
+ * same-shaped for every outcome — no such account, already verified, or a
+ * fresh link genuinely sent — because this is an unauthenticated, public
+ * endpoint: the response must not become an account-existence oracle any
+ * more than login()'s generic 401 above is. Callers always get the same
+ * "if applicable, check your email" response; see auth.controller.ts.
+ */
+export async function requestEmailVerification(rawEmail: string): Promise<void> {
+  const email = normalizeEmail(rawEmail);
+  const user = await prisma.user.findUnique({ where: { email } });
+  if (!user || user.isEmailVerified) {
+    return;
+  }
+  const token = await createVerificationToken(user.id, VerificationPurpose.EMAIL_VERIFICATION);
+  await sendVerificationEmail(user.email, token);
+}
+
+/** Consumes an email-verification token and marks the account verified. */
+export async function confirmEmailVerification(rawToken: string): Promise<void> {
+  const { userId } = await consumeVerificationToken(rawToken, VerificationPurpose.EMAIL_VERIFICATION);
+  await prisma.user.update({ where: { id: userId }, data: { isEmailVerified: true } });
+}
+
+/**
+ * Requests a password-reset link. Same enumeration-resistant shape as
+ * requestEmailVerification above: no account with this email is not
+ * distinguishable, from the response, from a fresh link genuinely sent.
+ */
+export async function requestPasswordReset(rawEmail: string): Promise<void> {
+  const email = normalizeEmail(rawEmail);
+  const user = await prisma.user.findUnique({ where: { email } });
+  if (!user) {
+    return;
+  }
+  const token = await createVerificationToken(user.id, VerificationPurpose.PASSWORD_RESET);
+  await sendPasswordResetEmail(user.email, token);
+}
+
+/**
+ * Consumes a password-reset token, sets the new password, and:
+ *  - marks the account's email verified — successfully consuming this token
+ *    IS proof of ownership of the address (it could only have been
+ *    consumed by whoever received it there), which is exactly the signal
+ *    google.service.ts's findOrCreateGoogleUser now requires before it will
+ *    link a Google identity onto this account (see that file's account-
+ *    takeover fix). This is the intended way out of that block: if an
+ *    attacker signed up first with someone else's email, the real owner
+ *    resetting the password here both reclaims the account AND clears the
+ *    way for their Google sign-in to link cleanly next time.
+ *  - clears any stale lockout state, so the new password isn't immediately
+ *    unusable because of failed attempts against the old one.
+ *  - revokes every outstanding refresh token for the account — whoever set
+ *    the OLD password (possibly an attacker) must not keep a working
+ *    session after control of the account changes hands here.
+ */
+export async function confirmPasswordReset(rawToken: string, newPassword: string): Promise<void> {
+  const { userId } = await consumeVerificationToken(rawToken, VerificationPurpose.PASSWORD_RESET);
+  const passwordHash = await hashPassword(newPassword);
+  await prisma.user.update({
+    where: { id: userId },
+    data: {
+      passwordHash,
+      isEmailVerified: true,
+      failedLoginAttempts: 0,
+      lockedUntil: null,
+    },
+  });
+  await revokeAllTokensForUser(userId);
 }

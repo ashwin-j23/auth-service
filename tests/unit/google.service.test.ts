@@ -40,8 +40,10 @@ describe('google.service findOrCreateGoogleUser', () => {
     expect(prismaMock.user.create).not.toHaveBeenCalled();
   });
 
-  it('links googleId onto a matching-email account when the email is verified', async () => {
-    prismaMock.user.findFirst.mockResolvedValue(buildUser({ googleId: null }));
+  it('links googleId onto a matching-email account when both Google AND the existing account have verified the email', async () => {
+    prismaMock.user.findFirst.mockResolvedValue(
+      buildUser({ googleId: null, isEmailVerified: true }),
+    );
     prismaMock.user.update.mockResolvedValue(
       buildUser({ googleId: profile.googleId, isEmailVerified: true }),
     );
@@ -50,10 +52,33 @@ describe('google.service findOrCreateGoogleUser', () => {
 
     expect(prismaMock.user.update).toHaveBeenCalledWith(
       expect.objectContaining({
-        data: { googleId: profile.googleId, isEmailVerified: true },
+        data: { googleId: profile.googleId },
       }),
     );
     expect(result.googleId).toBe(profile.googleId);
+  });
+
+  // The account-takeover fix (see google.service.ts's comment on this
+  // check): Google verifying ITS copy of the email is not proof that the
+  // EXISTING local account ever did. auth.service.ts's signup() never
+  // required email verification for a password account, so without this
+  // check an attacker could sign up first with someone else's (real,
+  // Google-account-holding) email address, and that victim's later,
+  // genuinely Google-verified sign-in would silently link onto — and leave
+  // standing password access on — the attacker's account.
+  it('refuses to link when the EXISTING account has never verified its own email, even though Google verified its copy', async () => {
+    prismaMock.user.findFirst.mockResolvedValue(
+      buildUser({ googleId: null, isEmailVerified: false }),
+    );
+
+    await expect(findOrCreateGoogleUser(profile)).rejects.toMatchObject(
+      new AppError(
+        409,
+        'An account with this email already exists but has not verified ownership of it. ' +
+          'Verify your email or reset your password first, then sign in with Google again.',
+      ),
+    );
+    expect(prismaMock.user.update).not.toHaveBeenCalled();
   });
 
   it('closes the concurrent-link race: a P2002 from update() resolves to the already-linked row', async () => {
@@ -62,7 +87,7 @@ describe('google.service findOrCreateGoogleUser', () => {
     // googleId: null (the other caller hasn't committed yet), so it
     // proceeds to update() — which is where the real `googleId` unique
     // constraint catches it, because the other caller's update already won.
-    const existing = buildUser({ googleId: null });
+    const existing = buildUser({ googleId: null, isEmailVerified: true });
     const winner = buildUser({ ...existing, googleId: profile.googleId });
     prismaMock.user.findFirst.mockResolvedValueOnce(existing);
     prismaMock.user.update.mockRejectedValue(
@@ -86,7 +111,12 @@ describe('google.service findOrCreateGoogleUser', () => {
     // re-fetching by googleId finds someone whose email doesn't match the
     // row we were trying to link. That's a real conflict, not two callers
     // racing to link the same account, and must not be silently papered over.
-    const existing = buildUser({ id: 'user-1', email: 'jane@example.com', googleId: null });
+    const existing = buildUser({
+      id: 'user-1',
+      email: 'jane@example.com',
+      googleId: null,
+      isEmailVerified: true,
+    });
     const someoneElse = buildUser({
       id: 'user-2',
       email: 'someone-else@example.com',
@@ -106,8 +136,10 @@ describe('google.service findOrCreateGoogleUser', () => {
     );
   });
 
-  it('refuses to link an existing account when Google has not verified the email', async () => {
-    prismaMock.user.findFirst.mockResolvedValue(buildUser({ googleId: null }));
+  it('refuses to link an existing account when Google has not verified the email, even if the existing account has', async () => {
+    prismaMock.user.findFirst.mockResolvedValue(
+      buildUser({ googleId: null, isEmailVerified: true }),
+    );
 
     await expect(
       findOrCreateGoogleUser({ ...profile, emailVerified: false }),

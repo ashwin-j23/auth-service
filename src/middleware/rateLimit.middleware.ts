@@ -1,6 +1,14 @@
 import rateLimit from 'express-rate-limit';
 import { env } from '../config/env';
 
+// express-rate-limit's default store (used here — no `store` option passed)
+// is in-memory and per-process, the same scope as oauthHandoff.service.ts's
+// handoff store (see that file's comment). Fine for this project's stated
+// single-instance scope, but worth calling out in the same place: running
+// more than one instance behind a load balancer gives each instance its own
+// counters, which effectively multiplies every limit here by instance count
+// rather than enforcing one shared budget per client. A horizontally-scaled
+// deployment needs a shared store instead (e.g. `rate-limit-redis`).
 function makeLimiter(max: number) {
   return rateLimit({
     windowMs: env.RATE_LIMIT_WINDOW_MS,
@@ -27,3 +35,14 @@ function makeLimiter(max: number) {
 // for instance).
 export const strictAuthRateLimiter = makeLimiter(env.RATE_LIMIT_STRICT_MAX);
 export const standardAuthRateLimiter = makeLimiter(env.RATE_LIMIT_STANDARD_MAX);
+
+// A THIRD separate instance, for the exact same reason the two above are
+// separate from each other: `/email/verify` and `/password/reset` (the
+// "request" endpoints — auth.routes.ts) are, like signup/login, driven by a
+// caller-supplied email address rather than a token, so they deserve the
+// same tight, per-IP budget — but reusing `strictAuthRateLimiter`'s own
+// instance would mean sharing its counter, and a burst of password-reset
+// requests could then exhaust the same budget login needs and lock a
+// different, innocent user out of signing in. Same numeric cap
+// (`RATE_LIMIT_STRICT_MAX`) as strict, but its own independent count.
+export const emailRateLimiter = makeLimiter(env.RATE_LIMIT_STRICT_MAX);

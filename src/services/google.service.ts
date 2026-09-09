@@ -116,9 +116,9 @@ export async function exchangeCodeForProfile(
  * Finds the local user matching a Google profile, creating or linking one as
  * needed:
  *  - already linked to this Google account -> return it
- *  - an account with this email exists (e.g. signed up with a password) ->
- *    link it, but only if Google has verified the email, so an attacker
- *    can't hijack an existing account via an unverified email address
+ *  - an account with this email exists (e.g. signed up with a password) AND
+ *    that account has already independently proven ownership of the email
+ *    (isEmailVerified) -> link it, but only then — see the comment below
  *  - otherwise -> create a brand-new, password-less account
  *
  * A single query checks both `googleId` and `email` (rather than two
@@ -139,10 +139,35 @@ export async function findOrCreateGoogleUser(profile: GoogleProfile) {
     if (!profile.emailVerified) {
       throw new AppError(400, 'Google account email is not verified');
     }
+    if (!existing.isEmailVerified) {
+      // The account-takeover fix: `profile.emailVerified` only says GOOGLE
+      // has verified this email — it says nothing about whether THIS
+      // existing row ever did. auth.service.ts's signup() never required
+      // proof of email ownership for a password account, so without this
+      // check an attacker could sign up first with someone else's email
+      // (no verification needed), and the real owner's later, genuinely
+      // Google-verified sign-in would silently link onto — and leave
+      // standing, working password access on — the attacker's account.
+      // This is the "classic-federated merge" pre-account-hijacking
+      // pattern (Paverd et al., USENIX Security 2022).
+      //
+      // Refuse the silent link. The user has to prove they hold the
+      // EXISTING account first — either verifying its email
+      // (POST /auth/email/verify/*) or resetting its password
+      // (POST /auth/password/reset/*, which also marks the email verified
+      // and revokes every outstanding session on the account — see
+      // auth.service.ts's confirmPasswordReset) — after which this exact
+      // Google sign-in links cleanly on the next attempt.
+      throw new AppError(
+        409,
+        'An account with this email already exists but has not verified ownership of it. ' +
+          'Verify your email or reset your password first, then sign in with Google again.',
+      );
+    }
     try {
       return await prisma.user.update({
         where: { id: existing.id },
-        data: { googleId: profile.googleId, isEmailVerified: true },
+        data: { googleId: profile.googleId },
       });
     } catch (err) {
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
