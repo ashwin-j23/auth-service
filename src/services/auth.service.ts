@@ -155,50 +155,92 @@ export async function login(input: LoginInput): Promise<AuthResult> {
     // spreads guesses across many IPs against one specific account; this
     // closes that gap by counting failures on the account itself.
     //
-    // `previousLockExpired` (checked here, not just "is it still in the
-    // future" — already ruled out above) is the signal an earlier lockout
-    // happened and has since expired: that gets a fresh count rather than
-    // starting permanently pinned at the limit, since without this a user
-    // who once got locked out would re-lock on their very next mistake,
-    // forever, instead of getting a normal-length grace window again.
+    // A SINGLE atomic UPDATE, not a JS-computed value written back, and not
+    // split across two separate writes either. Both of those were real
+    // races:
+    //  - An earlier version computed `attempts = current + 1` in JS from the
+    //    row read at the top of this function, then wrote that literal
+    //    value back — several wrong-password requests fired concurrently
+    //    (trivial for an attacker to do) could all read the same starting
+    //    count before any of them committed, collapsing N failures into the
+    //    count advancing by just 1.
+    //  - A version after that fixed the increment itself (Prisma's atomic
+    //    `{ increment: 1 }`) but still used a SECOND, separate write to set
+    //    `lockedUntil` once the returned count crossed the threshold — if
+    //    that second write failed (or simply hadn't happened yet when some
+    //    other request read this row), the account could sit AT the
+    //    threshold but still unlocked. The "previous lockout expired, reset
+    //    to a fresh count" branch had the same shape of bug one level up:
+    //    it wrote a literal `failedLoginAttempts: 1`, so two requests
+    //    racing right at that reset boundary could each write `1` and one
+    //    of their failures would vanish instead of counting.
     //
-    // The increment itself uses Prisma's atomic `{ increment: 1 }` — NOT a
-    // value computed in JS from `user.failedLoginAttempts` (the row as read
-    // at the top of this function) and written back. That used to be a real
-    // race: several wrong-password requests fired concurrently (trivial for
-    // an attacker to do) could all read the same starting count before any
-    // of them committed their write, collapsing N failures into the count
-    // advancing by just 1 — silently undermining the one thing this counter
-    // exists to blunt. `{ increment: 1 }` is resolved by Postgres against
-    // the row's actual current value at write time, the same reason
-    // token.service.ts's rotateRefreshToken uses a conditional update
-    // instead of a JS-computed one, so concurrent guesses now correctly
-    // stack instead of colliding.
-    const previousLockExpired = user.lockedUntil !== null;
-    const updated = await prisma.user.update({
-      where: { id: user.id },
-      data: previousLockExpired
-        ? { failedLoginAttempts: 1, lockedUntil: null }
-        : { failedLoginAttempts: { increment: 1 }, lockedUntil: null },
-    });
-
-    // The lockout decision is re-derived from `updated.failedLoginAttempts`
-    // — the count Postgres actually returns after the atomic increment
-    // above — not from any value computed earlier in this function, so it
-    // reflects every concurrent failure that landed, not just this one.
-    if (updated.failedLoginAttempts >= env.LOCKOUT_MAX_ATTEMPTS) {
-      // A second, separate write, but it doesn't need to be atomic-with-the
-      // read above to stay correct: every concurrent request past the
-      // threshold computes "lock until" from `env.LOCKOUT_DURATION_MS`
-      // relative to its own `now`, so at worst two racing requests set
-      // `lockedUntil` to two slightly different — but both still correctly
-      // in-the-future — timestamps. Never an inconsistent "should be locked
-      // but isn't" state.
-      await prisma.user.update({
-        where: { id: user.id },
-        data: { lockedUntil: new Date(Date.now() + env.LOCKOUT_DURATION_MS) },
-      });
-    }
+    // One `UPDATE` closes all three at once: Postgres evaluates the whole
+    // SET clause — the reset-vs-increment decision AND the lockout decision
+    // — against this row's actual state at the moment it acquires the row
+    // lock for this statement, so there's no window between "compute the
+    // new count" and "decide whether to lock" for a second write to fail
+    // or another request to interleave.
+    //
+    // `"lockedUntil" IS NOT NULL AND "lockedUntil" > ${now}` — an ACTIVE
+    // lock, not just any non-null one — is checked FIRST and, if true,
+    // preserves the existing `lockedUntil` untouched rather than
+    // recomputing it. Checking only `IS NOT NULL` (an earlier version of
+    // this statement) can't tell "this lock expired a while ago" apart
+    // from "a concurrent sibling request just now set this lock, this very
+    // millisecond, because the count crossed the threshold" — the latter
+    // is a real, easy-to-hit case: several requests can all read the row
+    // (via the `isLocked` check above, which runs before this) while it's
+    // still unlocked, then race each other into this UPDATE; whichever
+    // commits first sets `lockedUntil` to a FUTURE date, and every sibling
+    // still queued behind it would otherwise see "lockedUntil is set" and
+    // wrongly treat that fresh, still-active lock as an EXPIRED one —
+    // resetting the count back down to 1 and clearing the very lock a
+    // sibling request just correctly set, one row-lock-acquisition later.
+    // Reproduced directly against a real Postgres instance: 10 truly
+    // concurrent wrong-password requests against a fresh account
+    // intermittently ended with the account unlocked and a failure count
+    // well under the threshold, before this check was added.
+    //
+    // "the current time" here is a JS `Date` BOUND AS A PARAMETER
+    // (`${now}`), never SQL's `NOW()` — this isn't just style consistency
+    // with `isLocked` above. `lockedUntil` is a `TIMESTAMP WITHOUT TIME
+    // ZONE`; on a connection whose session `TimeZone` isn't UTC (verified
+    // live: this DB's isn't), a value written via `NOW()` — evaluated
+    // server-side against that session setting, then implicitly cast to
+    // the naive column — and a value written via a bound Date parameter
+    // (Prisma's own read/write path, confirmed to round-trip correctly on
+    // its own) are NOT guaranteed to agree once read back through Prisma:
+    // forcing `lockedUntil` into the past with `NOW() - interval '1
+    // second'` in raw SQL, then having this app read it back moments
+    // later, showed a Date still hours in the future — a timezone offset
+    // applied going in but never reversed coming out. The app itself never
+    // writes through `NOW()` (every write, including this statement, binds
+    // a JS Date), so this specific mismatch has no path into production —
+    // but it costs nothing to bind every comparison here through the exact
+    // same `${now}` this function already needs, rather than leaning on a
+    // Postgres session setting this code doesn't control and has no way to
+    // verify from here.
+    const now = new Date();
+    const lockUntilIfThresholdReached = new Date(now.getTime() + env.LOCKOUT_DURATION_MS);
+    await prisma.$executeRaw`
+      UPDATE users
+      SET "failedLoginAttempts" = CASE
+            WHEN "lockedUntil" IS NOT NULL AND "lockedUntil" <= ${now} THEN 1
+            ELSE "failedLoginAttempts" + 1
+          END,
+          "lockedUntil" = CASE
+            WHEN "lockedUntil" IS NOT NULL AND "lockedUntil" > ${now} THEN "lockedUntil"
+            WHEN (
+              CASE WHEN "lockedUntil" IS NOT NULL AND "lockedUntil" <= ${now} THEN 1
+                   ELSE "failedLoginAttempts" + 1
+              END
+            ) >= ${env.LOCKOUT_MAX_ATTEMPTS}
+            THEN ${lockUntilIfThresholdReached}
+            ELSE NULL
+          END
+      WHERE id = ${user.id}
+    `;
     throw invalidCredentials();
   }
 
@@ -234,10 +276,25 @@ export async function requestEmailVerification(rawEmail: string): Promise<void> 
   await sendVerificationEmail(user.email, token);
 }
 
-/** Consumes an email-verification token and marks the account verified. */
+/**
+ * Consumes an email-verification token and marks the account verified.
+ *
+ * Both steps run in one transaction: consuming the token burns it
+ * (single-use, irreversible) whether or not the follow-up write succeeds,
+ * so doing them separately would mean a failed `user.update` — a
+ * transient DB error, say — leaves the account unverified with its one
+ * link already spent and no way to retry it, only to request a whole new
+ * one. Committing them together means either both happen or neither does.
+ */
 export async function confirmEmailVerification(rawToken: string): Promise<void> {
-  const { userId } = await consumeVerificationToken(rawToken, VerificationPurpose.EMAIL_VERIFICATION);
-  await prisma.user.update({ where: { id: userId }, data: { isEmailVerified: true } });
+  await prisma.$transaction(async (tx) => {
+    const { userId } = await consumeVerificationToken(
+      rawToken,
+      VerificationPurpose.EMAIL_VERIFICATION,
+      tx,
+    );
+    await tx.user.update({ where: { id: userId }, data: { isEmailVerified: true } });
+  });
 }
 
 /**
@@ -271,18 +328,29 @@ export async function requestPasswordReset(rawEmail: string): Promise<void> {
  *  - revokes every outstanding refresh token for the account — whoever set
  *    the OLD password (possibly an attacker) must not keep a working
  *    session after control of the account changes hands here.
+ *
+ * All three DB writes (consuming the token, updating the user row,
+ * revoking sessions) run in one transaction. Without that, a failure of
+ * just the LAST step — after the password update already committed — would
+ * leave the new password active while refresh tokens issued under the old
+ * one stayed valid: exactly the "attacker's session survives a reset"
+ * outcome this function's whole second half exists to prevent. Committing
+ * every effect of "this token was consumed" together means the token is
+ * never burned without also actually finishing the reset it paid for.
  */
 export async function confirmPasswordReset(rawToken: string, newPassword: string): Promise<void> {
-  const { userId } = await consumeVerificationToken(rawToken, VerificationPurpose.PASSWORD_RESET);
   const passwordHash = await hashPassword(newPassword);
-  await prisma.user.update({
-    where: { id: userId },
-    data: {
-      passwordHash,
-      isEmailVerified: true,
-      failedLoginAttempts: 0,
-      lockedUntil: null,
-    },
+  await prisma.$transaction(async (tx) => {
+    const { userId } = await consumeVerificationToken(rawToken, VerificationPurpose.PASSWORD_RESET, tx);
+    await tx.user.update({
+      where: { id: userId },
+      data: {
+        passwordHash,
+        isEmailVerified: true,
+        failedLoginAttempts: 0,
+        lockedUntil: null,
+      },
+    });
+    await revokeAllTokensForUser(userId, tx);
   });
-  await revokeAllTokensForUser(userId);
 }

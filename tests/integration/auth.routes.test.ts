@@ -17,6 +17,14 @@ jest.mock('../../src/services/mail.service', () => ({
 
 const app = createApp();
 
+// confirmEmailVerification/confirmPasswordReset (auth.service.ts) both run
+// inside `prisma.$transaction(async (tx) => {...})` — an unconfigured mock
+// of `$transaction` never actually invokes that callback, silently
+// skipping every write inside it. `tx` ends up being `prismaMock` itself.
+beforeEach(() => {
+  prismaMock.$transaction.mockImplementation((cb: any) => cb(prismaMock));
+});
+
 function buildUser(overrides: Partial<User> = {}): User {
   return {
     id: 'user-1',
@@ -193,6 +201,20 @@ describe('GET /api/auth/google/callback', () => {
     const location = new URL(res.headers.location);
     expect(location.origin + location.pathname).toBe(env.OAUTH_SUCCESS_REDIRECT_URL);
     expect(location.searchParams.get('error')).toBe('google_consent_denied');
+  });
+
+  // Narrower than "any truthy `error` param": a real provider-side failure
+  // (not the user declining consent) must NOT be mislabeled as
+  // google_consent_denied — it falls through to the existing "missing
+  // authorization code" handling instead, the same as before consent
+  // denial had its own branch at all.
+  it('does NOT treat a non-consent OAuth error (e.g. a provider failure) as consent denial', async () => {
+    const res = await request(app).get(
+      '/api/auth/google/callback?error=temporarily_unavailable&state=whatever',
+    );
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.message).toMatch(/missing authorization code/i);
   });
 });
 

@@ -109,13 +109,21 @@ function validateOAuthCallback(
   cookiePayload: OAuthCookiePayload | undefined,
 ): { code: string; nonce: string; codeVerifier: string } {
   const { code, state, error } = query;
-  if (typeof error === 'string') {
+  if (error === 'access_denied') {
     // Google redirects here with `?error=access_denied&state=...` (no
-    // `code` at all) when the user clicks "Cancel" on the consent screen —
-    // an easily-hit, completely normal part of this flow (anyone who's ever
-    // demoed it has hit Cancel by accident at least once), not a failure
-    // worth a raw API error page. Checked before the generic "missing code"
-    // case below specifically so this doesn't fall through into it.
+    // `code` at all) specifically when the user clicks "Cancel" on the
+    // consent screen — an easily-hit, completely normal part of this flow
+    // (anyone who's ever demoed it has hit Cancel by accident at least
+    // once), not a failure worth a raw API error page. Checked before the
+    // generic "missing code" case below specifically so this doesn't fall
+    // through into it.
+    //
+    // Deliberately narrower than "any truthy `error` param": OAuth defines
+    // other error codes (`server_error`, `temporarily_unavailable`,
+    // `invalid_request`, ...) that are real provider-side failures, not a
+    // user declining consent — those fall through to the generic
+    // "missing authorization code" handling below instead of being
+    // mislabeled as a cancellation.
     throw new OAuthConsentDeniedError(error);
   }
   if (typeof code !== 'string') {

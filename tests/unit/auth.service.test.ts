@@ -49,6 +49,17 @@ const mockConsumeVerificationToken = consumeVerificationToken as jest.Mock;
 const mockSendVerificationEmail = sendVerificationEmail as jest.Mock;
 const mockSendPasswordResetEmail = sendPasswordResetEmail as jest.Mock;
 
+// confirmEmailVerification/confirmPasswordReset both run their work inside
+// `prisma.$transaction(async (tx) => {...})` — an unconfigured mock of
+// `$transaction` (jest-mock-extended's default) never actually invokes that
+// callback, which would make every write inside it silently not happen.
+// Standing this passthrough up here (rather than per-test) means `tx` is
+// just `prismaMock` itself, so assertions on `prismaMock.user.update` etc.
+// still work unchanged for code that used to run outside a transaction.
+beforeEach(() => {
+  prismaMock.$transaction.mockImplementation((cb: any) => cb(prismaMock));
+});
+
 function buildUser(overrides: Partial<User> = {}): User {
   return {
     id: 'user-1',
@@ -216,65 +227,53 @@ describe('auth.service', () => {
     });
 
     describe('account lockout', () => {
-      it('increments failedLoginAttempts ATOMICALLY (Prisma { increment: 1 }, not a JS-computed value) on a wrong password, without locking yet', async () => {
+      // The reset-vs-increment-vs-lock decision now lives entirely inside
+      // ONE raw SQL statement (see login()'s comment) rather than being
+      // split across a read-then-JS-decide-then-write, or even across two
+      // separate atomic writes — both earlier shapes had a real race
+      // between concurrent wrong-password requests that this collapses
+      // into a single UPDATE. That also means the actual CASE-expression
+      // branching (increment vs. reset-after-expiry; lock vs. not) is
+      // evaluated BY POSTGRES, not by this application code, so a mocked
+      // Prisma client can't exercise that branching itself — these tests
+      // instead verify the *shape* of the call (one write, correct
+      // parameters), and the actual branching was verified end to end
+      // against a real Postgres instance (concurrent wrong-password
+      // requests correctly accumulating and locking the account — see the
+      // PR description).
+      it('issues exactly one atomic write on a wrong password, with the user id, lockout threshold, and a future lock-until timestamp as parameters', async () => {
         const passwordHash = await hashPassword('the-real-password');
         prismaMock.user.findUnique.mockResolvedValue(
           buildUser({ passwordHash, failedLoginAttempts: 1 }),
         );
-        // Simulates what Postgres would actually return: some OTHER
-        // concurrent failed attempt also landed between this request's read
-        // above and its write below, so the real count is 3, not the "2"
-        // this request would have computed itself from the stale value it
-        // read. The lockout decision below must come from this atomic
-        // increment's own result, not from `1 + 1`.
-        prismaMock.user.update.mockResolvedValue(
-          buildUser({ passwordHash, failedLoginAttempts: 3 }),
-        );
+        prismaMock.$executeRaw.mockResolvedValue(1);
 
         await expect(
           login({ email: 'jane@example.com', password: 'wrong' }),
         ).rejects.toMatchObject(new AppError(401, 'Invalid email or password'));
 
-        // Exactly one update call: the atomic increment. No second
-        // lockout-setting call, since 3 < LOCKOUT_MAX_ATTEMPTS (5 by default).
-        expect(prismaMock.user.update).toHaveBeenCalledTimes(1);
-        expect(prismaMock.user.update).toHaveBeenCalledWith({
-          where: { id: 'user-1' },
-          data: { failedLoginAttempts: { increment: 1 }, lockedUntil: null },
-        });
-      });
-
-      it('locks the account once LOCKOUT_MAX_ATTEMPTS is reached, using the count Postgres actually returns from the atomic increment', async () => {
-        const passwordHash = await hashPassword('the-real-password');
-        prismaMock.user.findUnique.mockResolvedValue(
-          buildUser({ passwordHash, failedLoginAttempts: env.LOCKOUT_MAX_ATTEMPTS - 1 }),
-        );
-        prismaMock.user.update.mockResolvedValueOnce(
-          buildUser({ passwordHash, failedLoginAttempts: env.LOCKOUT_MAX_ATTEMPTS }),
-        );
-
-        await expect(
-          login({ email: 'jane@example.com', password: 'wrong' }),
-        ).rejects.toMatchObject(new AppError(401, 'Invalid email or password'));
-
-        // Two calls: the atomic increment, then the separate lockedUntil-setting
-        // write once the returned count meets the threshold.
-        expect(prismaMock.user.update).toHaveBeenCalledTimes(2);
-        expect(prismaMock.user.update).toHaveBeenNthCalledWith(1, {
-          where: { id: 'user-1' },
-          data: { failedLoginAttempts: { increment: 1 }, lockedUntil: null },
-        });
-        const secondCallArgs = prismaMock.user.update.mock.calls[1][0];
-        expect(secondCallArgs.where).toEqual({ id: 'user-1' });
-        expect(secondCallArgs.data.lockedUntil).toBeInstanceOf(Date);
-        const lockedUntil = secondCallArgs.data.lockedUntil as Date;
-        expect(lockedUntil.getTime()).toBeGreaterThan(Date.now());
-        expect(lockedUntil.getTime()).toBeLessThanOrEqual(
+        // No `user.update` call at all for this path any more — replaced
+        // entirely by the single raw statement below.
+        expect(prismaMock.user.update).not.toHaveBeenCalled();
+        expect(prismaMock.$executeRaw).toHaveBeenCalledTimes(1);
+        const [, ...values] = prismaMock.$executeRaw.mock.calls[0] as unknown[];
+        expect(values).toContain('user-1');
+        expect(values).toContain(env.LOCKOUT_MAX_ATTEMPTS);
+        // The statement binds "now" (the reference instant, used for every
+        // comparison in it — see its comment on why NOT SQL's `NOW()`) more
+        // than once, alongside the one lock-until-if-locked value — the
+        // furthest-in-the-future Date among all of them has to be that
+        // lock-until value specifically.
+        const dateValues = values.filter((v): v is Date => v instanceof Date);
+        expect(dateValues.length).toBeGreaterThanOrEqual(2);
+        const lockUntilValue = dateValues.reduce((max, d) => (d > max ? d : max));
+        expect(lockUntilValue.getTime()).toBeGreaterThan(Date.now());
+        expect(lockUntilValue.getTime()).toBeLessThanOrEqual(
           Date.now() + env.LOCKOUT_DURATION_MS + 1000, // +1s slack for test execution time
         );
       });
 
-      it('rejects a currently-locked account with the SAME generic message, without ever calling comparePassword', async () => {
+      it('rejects a currently-locked account with the SAME generic message, without ever calling comparePassword or writing anything', async () => {
         const passwordHash = await hashPassword('the-real-password');
         const compareSpy = jest.spyOn(passwordUtils, 'comparePassword');
         prismaMock.user.findUnique.mockResolvedValue(
@@ -293,31 +292,8 @@ describe('auth.service', () => {
 
         expect(compareSpy).not.toHaveBeenCalled();
         expect(prismaMock.user.update).not.toHaveBeenCalled();
+        expect(prismaMock.$executeRaw).not.toHaveBeenCalled();
         compareSpy.mockRestore();
-      });
-
-      it('gives a fresh attempt count once a previous lockout has expired, rather than re-locking instantly', async () => {
-        const passwordHash = await hashPassword('the-real-password');
-        prismaMock.user.findUnique.mockResolvedValue(
-          buildUser({
-            passwordHash,
-            failedLoginAttempts: env.LOCKOUT_MAX_ATTEMPTS, // was at the limit...
-            lockedUntil: new Date(Date.now() - 1000), // ...but that lock expired 1s ago
-          }),
-        );
-        prismaMock.user.update.mockResolvedValue(buildUser({ passwordHash, failedLoginAttempts: 1 }));
-
-        await expect(
-          login({ email: 'jane@example.com', password: 'still-wrong' }),
-        ).rejects.toMatchObject(new AppError(401, 'Invalid email or password'));
-
-        // Fresh count (1), not env.LOCKOUT_MAX_ATTEMPTS + 1 — and NOT
-        // re-locked immediately just because the stored count was at the
-        // limit.
-        expect(prismaMock.user.update).toHaveBeenCalledWith({
-          where: { id: 'user-1' },
-          data: { failedLoginAttempts: 1, lockedUntil: null },
-        });
       });
 
       it('fully clears lockout state on a successful login after prior failed attempts', async () => {
@@ -400,9 +376,13 @@ describe('auth.service', () => {
 
       await confirmEmailVerification('raw-token');
 
+      // Third arg is the transaction client (`tx` — here, `prismaMock`
+      // itself, per the passthrough above) that both this call and the
+      // user.update below must share, so either both commit or neither does.
       expect(mockConsumeVerificationToken).toHaveBeenCalledWith(
         'raw-token',
         VerificationPurpose.EMAIL_VERIFICATION,
+        prismaMock,
       );
       expect(prismaMock.user.update).toHaveBeenCalledWith({
         where: { id: 'user-1' },
@@ -454,9 +434,14 @@ describe('auth.service', () => {
 
       await confirmPasswordReset('raw-token', 'brand-new-password');
 
+      // Third arg on both calls below is the shared transaction client
+      // (`tx` — here, `prismaMock`, per the passthrough above): consuming
+      // the token, updating the user, and revoking sessions all commit
+      // together or not at all.
       expect(mockConsumeVerificationToken).toHaveBeenCalledWith(
         'raw-token',
         VerificationPurpose.PASSWORD_RESET,
+        prismaMock,
       );
       const updateArgs = prismaMock.user.update.mock.calls[0][0];
       expect(updateArgs.where).toEqual({ id: 'user-1' });
@@ -464,7 +449,7 @@ describe('auth.service', () => {
       expect(updateArgs.data.isEmailVerified).toBe(true);
       expect(updateArgs.data.failedLoginAttempts).toBe(0);
       expect(updateArgs.data.lockedUntil).toBeNull();
-      expect(revokeAllTokensForUser).toHaveBeenCalledWith('user-1');
+      expect(revokeAllTokensForUser).toHaveBeenCalledWith('user-1', prismaMock);
     });
 
     it('propagates an invalid/expired/already-used token as-is, without touching the user row', async () => {

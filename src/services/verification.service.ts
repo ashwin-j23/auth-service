@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import { VerificationPurpose } from '@prisma/client';
+import { Prisma, VerificationPurpose } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { env } from '../config/env';
 import { AppError } from '../utils/AppError';
@@ -59,21 +59,31 @@ export async function createVerificationToken(
  * token. The `updateMany` WHERE clause below re-checks `usedAt: null`
  * against the row's state *at write time*, so only one caller's update can
  * ever actually match.
+ *
+ * `client` defaults to the top-level `prisma` but accepts a
+ * `Prisma.TransactionClient` too — auth.service.ts's confirmEmailVerification
+ * and confirmPasswordReset both pass one, so that consuming the token and
+ * applying its effect (marking the email verified; setting a new password)
+ * commit as a single atomic unit. Without that, a failure of the SECOND
+ * write would leave this token burned with no effect: single-use by
+ * design, so there'd be no way to retry the same link, only to request an
+ * entirely new one.
  */
 export async function consumeVerificationToken(
   rawToken: string,
   purpose: VerificationPurpose,
+  client: Prisma.TransactionClient | typeof prisma = prisma,
 ): Promise<{ userId: string }> {
   const invalidToken = () => new AppError(400, 'Invalid or expired token');
 
   const tokenHash = hashToken(rawToken);
-  const stored = await prisma.verificationToken.findUnique({ where: { tokenHash } });
+  const stored = await client.verificationToken.findUnique({ where: { tokenHash } });
 
   if (!stored || stored.purpose !== purpose || stored.usedAt || stored.expiresAt < new Date()) {
     throw invalidToken();
   }
 
-  const claim = await prisma.verificationToken.updateMany({
+  const claim = await client.verificationToken.updateMany({
     where: { id: stored.id, usedAt: null },
     data: { usedAt: new Date() },
   });

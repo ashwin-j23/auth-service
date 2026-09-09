@@ -63,15 +63,20 @@ Unit tests never touch a real database — Prisma is replaced with a deep mock
 (`tests/mocks/prisma.mock.ts`), so they run instantly and deterministically.
 See EXPLANATION.md for how the mocking works and what each test covers.
 
-This has actually been run, not just written: 145 tests passing (all 17
-suites), `tsc --noEmit` clean, and the full HTTP flow (including the new
-email-verification / password-reset / Google-linking fixes) exercised
+This has actually been run, not just written: 144 tests passing (all 17
+suites), `tsc --noEmit` clean, and the full HTTP flow (including the
+email-verification / password-reset / Google-linking fixes, and the
+follow-up fixes from an automated review of that same PR) exercised
 against a real Postgres instance — signup sending a real email through
 Ethereal, the Google-linking account-takeover block reproduced and then
 lifted via a real password reset, old passwords invalidated and sessions
-revoked on reset, and concurrent wrong-password requests correctly stacking
-under the atomic lockout counter. See the session transcript linked in the
-commit if you want the raw output.
+revoked on reset, a verification token consumed exactly once through its
+new transactional path, and — the one that actually caught a real bug —
+15-30 truly concurrent wrong-password requests against a fresh account,
+repeated across several fix iterations, until the account reliably ends
+up locked with a plausible attempt count every time instead of
+intermittently unlocked with an under-count. See the session transcript
+linked in the commit if you want the raw output.
 
 ## API
 
@@ -173,14 +178,31 @@ about before shipping this as-is:
   replayed — this project has no logging/alerting pipeline configured, so
   wiring that log line into real monitoring (it's the single most
   security-relevant event this service can produce) is the next step.
-- **Account-level lockout counter is now an atomic DB increment**
-  (`prisma.user.update({ data: { failedLoginAttempts: { increment: 1 } } })`
-  in `src/services/auth.service.ts`), not a JS-computed `+1` written back —
-  closes a race where several concurrent wrong-password requests could
-  collapse into the counter advancing by only 1 instead of N.
+- **Account-level lockout counter is now a single atomic `UPDATE`**
+  (`src/services/auth.service.ts`'s `login()`), not a JS-computed value
+  written back — closes a race where several concurrent wrong-password
+  requests could collapse into the counter advancing by only 1 instead of
+  N. Verified against a real, truly-concurrent Postgres run (see that
+  function's comment for the two bugs this closed and how each was
+  reproduced live, including a session-timezone gotcha in a mixed
+  raw-SQL/Prisma comparison that never actually shipped but is worth
+  knowing about).
 - **Google consent denial (`Cancel` on the consent screen) now redirects
   back to `OAUTH_SUCCESS_REDIRECT_URL?error=google_consent_denied`**
-  instead of dead-ending on a raw `400` — `src/controllers/auth.controller.ts`.
+  instead of dead-ending on a raw `400` — but only for that specific error
+  code; other OAuth provider errors (`server_error`,
+  `temporarily_unavailable`, ...) still get the generic handling, not a
+  misleading "consent denied" label — `src/controllers/auth.controller.ts`.
+- **Consuming a verification/reset token and applying its effect (marking
+  an email verified; setting a new password + revoking sessions) now
+  commit in one transaction** (`src/services/auth.service.ts`,
+  `src/services/verification.service.ts`) — a single-use token failing
+  partway through used to mean it was burned with no effect, or a new
+  password taking hold while old sessions stayed valid.
+- **`nodemailer` is pinned to `^10.0.1`** (up from `^6.9.15`) — the
+  original pin had three known CVEs (a stack-overflow DoS, a
+  disableFileAccess/disableUrlAccess bypass, and a quadratic-time address
+  parser), all fixed by `9.1.0`.
 - **Access/refresh tokens are returned in the JSON response body, not as
   `httpOnly` cookies** — a deliberate architectural choice, not an
   oversight, but one worth stating explicitly rather than leaving implicit:

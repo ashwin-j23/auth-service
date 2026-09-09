@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import type { User } from '@prisma/client';
+import { Prisma, type User } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { env } from '../config/env';
 import { signAccessToken } from '../utils/jwt';
@@ -54,9 +54,19 @@ export async function issueTokenPair(user: User): Promise<TokenPair> {
  * auth.service.ts's confirmPasswordReset can call the exact same mass-revoke
  * when a password is reset — whoever set the OLD password must not keep a
  * working session once control of the account changes hands.
+ *
+ * `client` defaults to the top-level `prisma` but accepts a
+ * `Prisma.TransactionClient` too, so confirmPasswordReset can run this in
+ * the SAME transaction as the password update itself — otherwise a failure
+ * of just this revoke (after the password update already committed) would
+ * leave the new password active while sessions issued under the old one
+ * stay valid, silently breaking the guarantee this function exists for.
  */
-export async function revokeAllTokensForUser(userId: string): Promise<void> {
-  await prisma.refreshToken.updateMany({
+export async function revokeAllTokensForUser(
+  userId: string,
+  client: Prisma.TransactionClient | typeof prisma = prisma,
+): Promise<void> {
+  await client.refreshToken.updateMany({
     where: { userId, revokedAt: null },
     data: { revokedAt: new Date() },
   });
