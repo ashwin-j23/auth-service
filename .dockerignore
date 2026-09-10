@@ -1,0 +1,14 @@
+node_modules
+dist
+coverage
+.env
+.env.local
+*.log
+.git
+.github
+.kilo
+.claude
+tests
+jest.config.js
+README.md
+EXPLANATION.md
