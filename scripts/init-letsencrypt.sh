@@ -25,18 +25,35 @@ rsa_key_size=4096
 data_path="./certbot"
 compose="docker compose"
 
+# The one argument this script takes is a notification email, not the
+# domain (that's hardcoded above — this always issues for
+# ashwin.opsmonsters.com). Catch the easy mix-up early instead of quietly
+# handing certbot a bogus --email value.
+case "$email" in
+  '' | *@*) ;;
+  *)
+    echo "error: '$email' doesn't look like an email address." >&2
+    echo "Usage: $0 [email-for-letsencrypt-notices]" >&2
+    exit 1
+    ;;
+esac
+
 if [ -d "$data_path/conf/live/$domain" ]; then
   echo "Existing certificate data found for $domain — skipping issuance."
   echo "Delete $data_path/conf/live/$domain first if you need to start over."
   exit 0
 fi
 
-echo "### Downloading recommended TLS parameters ..."
+echo "### Installing recommended TLS parameters ..."
 mkdir -p "$data_path/conf"
-curl -fsSL https://raw.githubusercontent.com/certbot/certbot/master/certbot-nginx/certbot_nginx/_internal/tls_configs/options-ssl-nginx.conf \
-  -o "$data_path/conf/options-ssl-nginx.conf"
-curl -fsSL https://raw.githubusercontent.com/certbot/certbot/master/certbot/certbot/ssl-dhparams.pem \
-  -o "$data_path/conf/ssl-dhparams.pem"
+# Bundled in the repo (nginx/tls/) rather than fetched from GitHub at deploy
+# time — that used to curl these from certbot's repo, which 404s the moment
+# that repo's default branch/path changes upstream. See git history.
+cp "$(dirname "$0")/../nginx/tls/options-ssl-nginx.conf" "$data_path/conf/options-ssl-nginx.conf"
+if [ ! -f "$data_path/conf/ssl-dhparams.pem" ]; then
+  echo "### Generating a 2048-bit DH param file (one-time, takes a few seconds-minutes) ..."
+  openssl dhparam -out "$data_path/conf/ssl-dhparams.pem" 2048
+fi
 
 echo "### Creating a dummy certificate for $domain so nginx can start ..."
 path="/etc/letsencrypt/live/$domain"
