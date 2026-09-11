@@ -20,15 +20,14 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-auth_service}
-    # Bound to localhost only, same reasoning as the app service below —
-    # nothing outside this box needs to reach Postgres directly (migrate/app
-    # talk to it over the internal auth_service_net network via the
-    # `postgres` hostname); this just keeps host-level psql access (e.g. over
-    # an SSH tunnel) available without publishing a database port to the
-    # internet, and avoids colliding with any Postgres already using 5432 on
-    # the host.
-    ports:
-      - '127.0.0.1:${POSTGRES_PORT:-5432}:5432'
+    # No `ports:` published on purpose — migrate/app reach this over the
+    # internal auth_service_net network via the `postgres` hostname, so
+    # nothing needs a host port at all. Also sidesteps colliding with any
+    # Postgres already running directly on the host (a real problem hit on
+    # a shared server — see git history) instead of just moving the
+    # collision from 0.0.0.0 to 127.0.0.1. For ad-hoc psql access, use
+    # `docker compose exec postgres psql -U postgres -d auth_service`
+    # rather than publishing a port for it.
     volumes:
       - auth_service_pgdata:/var/lib/postgresql/data
     healthcheck:

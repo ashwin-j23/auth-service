@@ -66,7 +66,12 @@ Config is in `nginx/conf.d/ashwin.opsmonsters.com.conf`.
 
 Prerequisites:
 
-- A server with Docker + the Compose plugin, ports 80 and 443 open.
+- A server with Docker + the Compose plugin, **with ports 80 and 443 free
+  for this compose file's `nginx` service to bind** — i.e. nothing else on
+  the host (a system-level nginx/Apache, another reverse proxy) is already
+  listening on them. On a box shared with other sites/services, that's
+  usually not true — see "Deploying behind an existing reverse proxy"
+  below instead.
 - `ashwin.opsmonsters.com`'s DNS record in Cloudflare already points at
   this server's IP and is set to **DNS-only (grey cloud)** — Let's
   Encrypt's HTTP challenge and TLS termination both happen on this box
@@ -108,6 +113,30 @@ own to pick up a renewed cert — add a host cron entry like:
 ```
 
 (harmless to run daily even when nothing renewed).
+
+### Deploying behind an existing reverse proxy
+
+If the target box already runs its own nginx/Apache/other proxy for other
+sites (common on a shared server), ports 80/443 are already taken and this
+compose file's `nginx`/`certbot` services will never be able to bind them
+— don't try to run those two services there. Instead:
+
+```bash
+cp .env.example .env
+# same secrets as above; TRUST_PROXY=1 explicitly this time — the
+# docker-compose.yml default only applies when its own nginx is in front
+echo "TRUST_PROXY=1" >> .env
+
+docker compose up -d postgres migrate app   # skip nginx and certbot
+curl http://127.0.0.1:4000/health           # confirm it's up locally
+```
+
+Then, on the host's *existing* nginx (needs whoever has root there — this
+does nothing you can do from inside this repo), add a new server block for
+`ashwin.opsmonsters.com` proxying to `127.0.0.1:4000` (mirroring
+`nginx/conf.d/ashwin.opsmonsters.com.conf`'s `location` blocks), and issue
+its cert the same way the box's other sites already get theirs — most
+commonly `sudo certbot --nginx -d ashwin.opsmonsters.com`.
 
 ## Tests
 
