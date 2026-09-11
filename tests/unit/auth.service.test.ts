@@ -1,20 +1,64 @@
-import { Prisma, type User } from '@prisma/client';
+import { Prisma, VerificationPurpose, type User } from '@prisma/client';
 import { prismaMock } from '../mocks/prisma.mock';
-import { signup, login } from '../../src/services/auth.service';
+import {
+  signup,
+  login,
+  requestEmailVerification,
+  confirmEmailVerification,
+  requestPasswordReset,
+  confirmPasswordReset,
+} from '../../src/services/auth.service';
 import * as passwordUtils from '../../src/utils/password';
 import { hashPassword } from '../../src/utils/password';
 import { AppError } from '../../src/utils/AppError';
 import { env } from '../../src/config/env';
 
-// issueTokenPair hits prisma.refreshToken.create internally — stub it at the
-// module boundary so these tests stay focused on signup/login logic rather
-// than re-asserting token-service behaviour (already covered separately).
+// issueTokenPair/revokeAllTokensForUser hit prisma.refreshToken.* internally
+// — stub the module boundary so these tests stay focused on
+// signup/login/verification logic rather than re-asserting token-service
+// behaviour (already covered separately, tests/unit/token.service.test.ts).
 jest.mock('../../src/services/token.service', () => ({
   issueTokenPair: jest.fn().mockResolvedValue({
     accessToken: 'fake-access-token',
     refreshToken: 'fake-refresh-token',
   }),
+  revokeAllTokensForUser: jest.fn().mockResolvedValue(undefined),
 }));
+
+// createVerificationToken/consumeVerificationToken hit prisma.verificationToken.*
+// internally — same reasoning, and covered separately in
+// tests/unit/verification.service.test.ts.
+jest.mock('../../src/services/verification.service', () => ({
+  createVerificationToken: jest.fn().mockResolvedValue('fake-verification-token'),
+  consumeVerificationToken: jest.fn(),
+}));
+
+// Actually sending mail (mail.service.ts) hits the network (Ethereal) — must
+// never run in a unit test. Covered separately, and only ever asserted here
+// as "was this called", never actually executed.
+jest.mock('../../src/services/mail.service', () => ({
+  sendVerificationEmail: jest.fn().mockResolvedValue(undefined),
+  sendPasswordResetEmail: jest.fn().mockResolvedValue(undefined),
+}));
+
+import { createVerificationToken, consumeVerificationToken } from '../../src/services/verification.service';
+import { sendVerificationEmail, sendPasswordResetEmail } from '../../src/services/mail.service';
+
+const mockCreateVerificationToken = createVerificationToken as jest.Mock;
+const mockConsumeVerificationToken = consumeVerificationToken as jest.Mock;
+const mockSendVerificationEmail = sendVerificationEmail as jest.Mock;
+const mockSendPasswordResetEmail = sendPasswordResetEmail as jest.Mock;
+
+// confirmEmailVerification/confirmPasswordReset both run their work inside
+// `prisma.$transaction(async (tx) => {...})` — an unconfigured mock of
+// `$transaction` (jest-mock-extended's default) never actually invokes that
+// callback, which would make every write inside it silently not happen.
+// Standing this passthrough up here (rather than per-test) means `tx` is
+// just `prismaMock` itself, so assertions on `prismaMock.user.update` etc.
+// still work unchanged for code that used to run outside a transaction.
+beforeEach(() => {
+  prismaMock.$transaction.mockImplementation((cb: any) => cb(prismaMock));
+});
 
 function buildUser(overrides: Partial<User> = {}): User {
   return {
@@ -71,6 +115,34 @@ describe('auth.service', () => {
         accessToken: 'fake-access-token',
         refreshToken: 'fake-refresh-token',
       });
+
+      // The email-verification blocker fix: signup now issues a
+      // verification token and emails it, best-effort.
+      expect(mockCreateVerificationToken).toHaveBeenCalledWith(
+        'user-1',
+        VerificationPurpose.EMAIL_VERIFICATION,
+      );
+      expect(mockSendVerificationEmail).toHaveBeenCalledWith(
+        'jane@example.com',
+        'fake-verification-token',
+      );
+    });
+
+    it('still succeeds (and still returns tokens) if the verification email fails to send', async () => {
+      prismaMock.user.findUnique.mockResolvedValue(null);
+      prismaMock.user.create.mockImplementation((async ({ data }: any) => buildUser({
+        email: data.email,
+        passwordHash: data.passwordHash,
+        name: data.name,
+      })) as any);
+      mockCreateVerificationToken.mockRejectedValueOnce(new Error('db unavailable'));
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+
+      const result = await signup({ email: 'jane@example.com', password: 'password123' });
+
+      expect(result.tokens.accessToken).toBe('fake-access-token');
+      expect(consoleErrorSpy).toHaveBeenCalled();
+      consoleErrorSpy.mockRestore();
     });
 
     it('closes the signup race: a duplicate caught only by the DB constraint still gets a clean 409', async () => {
@@ -137,6 +209,7 @@ describe('auth.service', () => {
     it('rejects an incorrect password', async () => {
       const passwordHash = await hashPassword('the-real-password');
       prismaMock.user.findUnique.mockResolvedValue(buildUser({ passwordHash }));
+      prismaMock.user.update.mockResolvedValue(buildUser({ passwordHash, failedLoginAttempts: 1 }));
 
       await expect(
         login({ email: 'jane@example.com', password: 'wrong-password' }),
@@ -154,43 +227,53 @@ describe('auth.service', () => {
     });
 
     describe('account lockout', () => {
-      it('increments failedLoginAttempts on a wrong password, without locking yet', async () => {
+      // The reset-vs-increment-vs-lock decision now lives entirely inside
+      // ONE raw SQL statement (see login()'s comment) rather than being
+      // split across a read-then-JS-decide-then-write, or even across two
+      // separate atomic writes — both earlier shapes had a real race
+      // between concurrent wrong-password requests that this collapses
+      // into a single UPDATE. That also means the actual CASE-expression
+      // branching (increment vs. reset-after-expiry; lock vs. not) is
+      // evaluated BY POSTGRES, not by this application code, so a mocked
+      // Prisma client can't exercise that branching itself — these tests
+      // instead verify the *shape* of the call (one write, correct
+      // parameters), and the actual branching was verified end to end
+      // against a real Postgres instance (concurrent wrong-password
+      // requests correctly accumulating and locking the account — see the
+      // PR description).
+      it('issues exactly one atomic write on a wrong password, with the user id, lockout threshold, and a future lock-until timestamp as parameters', async () => {
         const passwordHash = await hashPassword('the-real-password');
         prismaMock.user.findUnique.mockResolvedValue(
           buildUser({ passwordHash, failedLoginAttempts: 1 }),
         );
+        prismaMock.$executeRaw.mockResolvedValue(1);
 
         await expect(
           login({ email: 'jane@example.com', password: 'wrong' }),
         ).rejects.toMatchObject(new AppError(401, 'Invalid email or password'));
 
-        expect(prismaMock.user.update).toHaveBeenCalledWith({
-          where: { id: 'user-1' },
-          data: { failedLoginAttempts: 2, lockedUntil: null },
-        });
-      });
-
-      it('locks the account once LOCKOUT_MAX_ATTEMPTS is reached', async () => {
-        const passwordHash = await hashPassword('the-real-password');
-        prismaMock.user.findUnique.mockResolvedValue(
-          buildUser({ passwordHash, failedLoginAttempts: env.LOCKOUT_MAX_ATTEMPTS - 1 }),
-        );
-
-        await expect(
-          login({ email: 'jane@example.com', password: 'wrong' }),
-        ).rejects.toMatchObject(new AppError(401, 'Invalid email or password'));
-
-        const updateArgs = prismaMock.user.update.mock.calls[0][0];
-        expect(updateArgs.data.failedLoginAttempts).toBe(env.LOCKOUT_MAX_ATTEMPTS);
-        expect(updateArgs.data.lockedUntil).toBeInstanceOf(Date);
-        const lockedUntil = updateArgs.data.lockedUntil as Date;
-        expect(lockedUntil.getTime()).toBeGreaterThan(Date.now());
-        expect(lockedUntil.getTime()).toBeLessThanOrEqual(
+        // No `user.update` call at all for this path any more — replaced
+        // entirely by the single raw statement below.
+        expect(prismaMock.user.update).not.toHaveBeenCalled();
+        expect(prismaMock.$executeRaw).toHaveBeenCalledTimes(1);
+        const [, ...values] = prismaMock.$executeRaw.mock.calls[0] as unknown[];
+        expect(values).toContain('user-1');
+        expect(values).toContain(env.LOCKOUT_MAX_ATTEMPTS);
+        // The statement binds "now" (the reference instant, used for every
+        // comparison in it — see its comment on why NOT SQL's `NOW()`) more
+        // than once, alongside the one lock-until-if-locked value — the
+        // furthest-in-the-future Date among all of them has to be that
+        // lock-until value specifically.
+        const dateValues = values.filter((v): v is Date => v instanceof Date);
+        expect(dateValues.length).toBeGreaterThanOrEqual(2);
+        const lockUntilValue = dateValues.reduce((max, d) => (d > max ? d : max));
+        expect(lockUntilValue.getTime()).toBeGreaterThan(Date.now());
+        expect(lockUntilValue.getTime()).toBeLessThanOrEqual(
           Date.now() + env.LOCKOUT_DURATION_MS + 1000, // +1s slack for test execution time
         );
       });
 
-      it('rejects a currently-locked account with the SAME generic message, without ever calling comparePassword', async () => {
+      it('rejects a currently-locked account with the SAME generic message, without ever calling comparePassword or writing anything', async () => {
         const passwordHash = await hashPassword('the-real-password');
         const compareSpy = jest.spyOn(passwordUtils, 'comparePassword');
         prismaMock.user.findUnique.mockResolvedValue(
@@ -209,30 +292,8 @@ describe('auth.service', () => {
 
         expect(compareSpy).not.toHaveBeenCalled();
         expect(prismaMock.user.update).not.toHaveBeenCalled();
+        expect(prismaMock.$executeRaw).not.toHaveBeenCalled();
         compareSpy.mockRestore();
-      });
-
-      it('gives a fresh attempt count once a previous lockout has expired, rather than re-locking instantly', async () => {
-        const passwordHash = await hashPassword('the-real-password');
-        prismaMock.user.findUnique.mockResolvedValue(
-          buildUser({
-            passwordHash,
-            failedLoginAttempts: env.LOCKOUT_MAX_ATTEMPTS, // was at the limit...
-            lockedUntil: new Date(Date.now() - 1000), // ...but that lock expired 1s ago
-          }),
-        );
-
-        await expect(
-          login({ email: 'jane@example.com', password: 'still-wrong' }),
-        ).rejects.toMatchObject(new AppError(401, 'Invalid email or password'));
-
-        // Fresh count (1), not env.LOCKOUT_MAX_ATTEMPTS + 1 — and NOT
-        // re-locked immediately just because the stored count was at the
-        // limit.
-        expect(prismaMock.user.update).toHaveBeenCalledWith({
-          where: { id: 'user-1' },
-          data: { failedLoginAttempts: 1, lockedUntil: null },
-        });
       });
 
       it('fully clears lockout state on a successful login after prior failed attempts', async () => {
@@ -267,6 +328,137 @@ describe('auth.service', () => {
         await expect(login({ email: 'jane@example.com', password: 'x' })).rejects.toThrow();
         expect(prismaMock.user.update).not.toHaveBeenCalled();
       });
+    });
+  });
+
+  describe('requestEmailVerification', () => {
+    it('creates a token and emails it for an existing, unverified account', async () => {
+      prismaMock.user.findUnique.mockResolvedValue(
+        buildUser({ isEmailVerified: false }),
+      );
+
+      await requestEmailVerification('  Jane@Example.com  ');
+
+      expect(mockCreateVerificationToken).toHaveBeenCalledWith(
+        'user-1',
+        VerificationPurpose.EMAIL_VERIFICATION,
+      );
+      expect(mockSendVerificationEmail).toHaveBeenCalledWith(
+        'jane@example.com',
+        'fake-verification-token',
+      );
+    });
+
+    // Same enumeration-resistant shape as login()'s generic 401: neither of
+    // these "nothing to do" cases is distinguishable from a genuinely-sent
+    // link by the caller — both just silently return.
+    it('does nothing for a nonexistent account, without throwing', async () => {
+      prismaMock.user.findUnique.mockResolvedValue(null);
+
+      await expect(requestEmailVerification('nobody@example.com')).resolves.toBeUndefined();
+      expect(mockCreateVerificationToken).not.toHaveBeenCalled();
+      expect(mockSendVerificationEmail).not.toHaveBeenCalled();
+    });
+
+    it('does nothing for an already-verified account', async () => {
+      prismaMock.user.findUnique.mockResolvedValue(buildUser({ isEmailVerified: true }));
+
+      await requestEmailVerification('jane@example.com');
+
+      expect(mockCreateVerificationToken).not.toHaveBeenCalled();
+      expect(mockSendVerificationEmail).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('confirmEmailVerification', () => {
+    it('marks the account verified once the token is consumed', async () => {
+      mockConsumeVerificationToken.mockResolvedValue({ userId: 'user-1' });
+
+      await confirmEmailVerification('raw-token');
+
+      // Third arg is the transaction client (`tx` — here, `prismaMock`
+      // itself, per the passthrough above) that both this call and the
+      // user.update below must share, so either both commit or neither does.
+      expect(mockConsumeVerificationToken).toHaveBeenCalledWith(
+        'raw-token',
+        VerificationPurpose.EMAIL_VERIFICATION,
+        prismaMock,
+      );
+      expect(prismaMock.user.update).toHaveBeenCalledWith({
+        where: { id: 'user-1' },
+        data: { isEmailVerified: true },
+      });
+    });
+
+    it('propagates an invalid/expired/already-used token as-is', async () => {
+      mockConsumeVerificationToken.mockRejectedValue(new AppError(400, 'Invalid or expired token'));
+
+      await expect(confirmEmailVerification('bad-token')).rejects.toMatchObject(
+        new AppError(400, 'Invalid or expired token'),
+      );
+      expect(prismaMock.user.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('requestPasswordReset', () => {
+    it('creates a token and emails it for an existing account', async () => {
+      prismaMock.user.findUnique.mockResolvedValue(buildUser());
+
+      await requestPasswordReset('jane@example.com');
+
+      expect(mockCreateVerificationToken).toHaveBeenCalledWith(
+        'user-1',
+        VerificationPurpose.PASSWORD_RESET,
+      );
+      expect(mockSendPasswordResetEmail).toHaveBeenCalledWith(
+        'jane@example.com',
+        'fake-verification-token',
+      );
+    });
+
+    it('does nothing for a nonexistent account, without throwing (no enumeration signal)', async () => {
+      prismaMock.user.findUnique.mockResolvedValue(null);
+
+      await expect(requestPasswordReset('nobody@example.com')).resolves.toBeUndefined();
+      expect(mockCreateVerificationToken).not.toHaveBeenCalled();
+      expect(mockSendPasswordResetEmail).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('confirmPasswordReset', () => {
+    it('sets a new (hashed) password, marks the email verified, clears lockout state, and revokes every session', async () => {
+      mockConsumeVerificationToken.mockResolvedValue({ userId: 'user-1' });
+      const { revokeAllTokensForUser } = jest.requireMock('../../src/services/token.service') as {
+        revokeAllTokensForUser: jest.Mock;
+      };
+
+      await confirmPasswordReset('raw-token', 'brand-new-password');
+
+      // Third arg on both calls below is the shared transaction client
+      // (`tx` — here, `prismaMock`, per the passthrough above): consuming
+      // the token, updating the user, and revoking sessions all commit
+      // together or not at all.
+      expect(mockConsumeVerificationToken).toHaveBeenCalledWith(
+        'raw-token',
+        VerificationPurpose.PASSWORD_RESET,
+        prismaMock,
+      );
+      const updateArgs = prismaMock.user.update.mock.calls[0][0];
+      expect(updateArgs.where).toEqual({ id: 'user-1' });
+      expect(updateArgs.data.passwordHash).not.toBe('brand-new-password'); // hashed, not plain-text
+      expect(updateArgs.data.isEmailVerified).toBe(true);
+      expect(updateArgs.data.failedLoginAttempts).toBe(0);
+      expect(updateArgs.data.lockedUntil).toBeNull();
+      expect(revokeAllTokensForUser).toHaveBeenCalledWith('user-1', prismaMock);
+    });
+
+    it('propagates an invalid/expired/already-used token as-is, without touching the user row', async () => {
+      mockConsumeVerificationToken.mockRejectedValue(new AppError(400, 'Invalid or expired token'));
+
+      await expect(confirmPasswordReset('bad-token', 'brand-new-password')).rejects.toMatchObject(
+        new AppError(400, 'Invalid or expired token'),
+      );
+      expect(prismaMock.user.update).not.toHaveBeenCalled();
     });
   });
 });

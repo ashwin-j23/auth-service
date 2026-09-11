@@ -62,10 +62,11 @@ describe('token.service', () => {
       await expect(rotateRefreshToken('does-not-exist')).rejects.toThrow(AppError);
     });
 
-    it('rejects (and mass-revokes) a token that was already used once', async () => {
+    it('rejects (and mass-revokes) a token that was already used once, logging the reuse as a security event', async () => {
       const stored = fakeStoredRefreshToken({ revokedAt: new Date() });
       prismaMock.refreshToken.findUnique.mockResolvedValue(stored);
       prismaMock.refreshToken.updateMany.mockResolvedValue({ count: 1 });
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
 
       await expect(rotateRefreshToken('reused-token')).rejects.toThrow(
         'Refresh token has already been used',
@@ -73,6 +74,19 @@ describe('token.service', () => {
       expect(prismaMock.refreshToken.updateMany).toHaveBeenCalledWith(
         expect.objectContaining({ where: { userId: fakeUser.id, revokedAt: null } }),
       );
+
+      // The fix for "token-theft detection is silent": this used to revoke
+      // every session with no log, alert, or record anywhere. Now there's a
+      // structured log line naming the user and the reason, logged BEFORE
+      // the mass-revoke so it can't be lost if that write ever failed.
+      expect(consoleErrorSpy).toHaveBeenCalledTimes(1);
+      const loggedPayload = JSON.parse(consoleErrorSpy.mock.calls[0][0] as string);
+      expect(loggedPayload).toMatchObject({
+        event: 'refresh_token_reuse_detected',
+        userId: fakeUser.id,
+        reason: 'already-used',
+      });
+      consoleErrorSpy.mockRestore();
     });
 
     it('rejects an expired token', async () => {
@@ -117,7 +131,7 @@ describe('token.service', () => {
       expect(prismaMock.refreshToken.create).toHaveBeenCalledTimes(1);
     });
 
-    it('closes the rotation race: a lost claim (count 0) is treated as reuse, not a hard error', async () => {
+    it('closes the rotation race: a lost claim (count 0) is treated as reuse, not a hard error — and still logs it', async () => {
       // Simulates two concurrent rotate calls for the same token: this call's
       // findUnique still sees revokedAt: null (the other caller hasn't
       // committed yet), but by the time its own conditional updateMany runs,
@@ -128,6 +142,7 @@ describe('token.service', () => {
       prismaMock.refreshToken.updateMany
         .mockResolvedValueOnce({ count: 0 }) // lost the claim, inside the transaction
         .mockResolvedValueOnce({ count: 1 }); // the subsequent mass-revoke-for-user call
+      const consoleErrorSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
 
       await expect(rotateRefreshToken('raced-token')).rejects.toThrow(
         'Refresh token has already been used',
@@ -138,6 +153,14 @@ describe('token.service', () => {
       expect(prismaMock.refreshToken.updateMany).toHaveBeenLastCalledWith(
         expect.objectContaining({ where: { userId: fakeUser.id, revokedAt: null } }),
       );
+
+      const loggedPayload = JSON.parse(consoleErrorSpy.mock.calls[0][0] as string);
+      expect(loggedPayload).toMatchObject({
+        event: 'refresh_token_reuse_detected',
+        userId: fakeUser.id,
+        reason: 'lost-rotation-race',
+      });
+      consoleErrorSpy.mockRestore();
     });
   });
 

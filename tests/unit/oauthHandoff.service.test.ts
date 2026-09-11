@@ -1,7 +1,6 @@
 import { createHandoff, consumeHandoff } from '../../src/services/oauthHandoff.service';
 import type { PublicUser } from '../../src/utils/publicUser';
 import { withFreshEnv } from '../helpers/freshEnv';
-import { AppError } from '../../src/utils/AppError';
 
 const user: PublicUser = {
   id: 'user-1',
@@ -58,8 +57,16 @@ describe('oauthHandoff.service', () => {
         // The 4th call is the one that's actually causing the overload —
         // that's the one that fails, as a retryable 503, NOT an eviction of
         // someone else's already-issued, still-valid code.
+        //
+        // Matched by message string, not `new AppError(...)` — `fresh` was
+        // just `require()`'d after `jest.resetModules()` above, so its
+        // AppError is a SEPARATE class instance from the one imported at
+        // the top of this file, even though both come from the exact same
+        // source file. `.toThrow(errorInstance)` cares about that identity
+        // (constructor equality); a plain string only ever compares the
+        // message, which is what this assertion actually cares about.
         expect(() => fresh.createHandoff(user, tokens)).toThrow(
-          new AppError(503, 'Too many sign-ins in progress right now — please try again'),
+          'Too many sign-ins in progress right now — please try again',
         );
         expect(errorSpy).toHaveBeenCalledTimes(1);
 

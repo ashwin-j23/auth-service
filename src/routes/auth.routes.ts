@@ -1,13 +1,21 @@
 import { Router } from 'express';
 import * as authController from '../controllers/auth.controller';
 import { requireAuth } from '../middleware/auth.middleware';
-import { strictAuthRateLimiter, standardAuthRateLimiter } from '../middleware/rateLimit.middleware';
+import {
+  strictAuthRateLimiter,
+  standardAuthRateLimiter,
+  emailRateLimiter,
+} from '../middleware/rateLimit.middleware';
 import { validate } from '../middleware/validate.middleware';
 import {
   signupSchema,
   loginSchema,
   refreshSchema,
   googleExchangeSchema,
+  requestEmailVerificationSchema,
+  confirmEmailVerificationSchema,
+  requestPasswordResetSchema,
+  confirmPasswordResetSchema,
 } from '../validators/auth.validators';
 
 export const authRouter = Router();
@@ -43,4 +51,38 @@ authRouter.post(
   standardAuthRateLimiter,
   validate(googleExchangeSchema),
   authController.googleExchange,
+);
+
+// "request" endpoints (send an email keyed off an address the caller just
+// typed in) get their own tight budget (emailRateLimiter — see
+// rateLimit.middleware.ts for why this is a THIRD instance, not a reuse of
+// strictAuthRateLimiter): an unauthenticated, email-address-driven endpoint
+// is exactly the kind of thing that can be hammered (mailbox-bombing a
+// victim, or probing which addresses have accounts) if it isn't bounded
+// tightly. "confirm" endpoints take a specific, high-entropy, single-use
+// token instead of a guessable email address — the standard budget (same as
+// refresh/logout) is enough.
+authRouter.post(
+  '/email/verify',
+  emailRateLimiter,
+  validate(requestEmailVerificationSchema),
+  authController.requestEmailVerification,
+);
+authRouter.post(
+  '/email/verify/confirm',
+  standardAuthRateLimiter,
+  validate(confirmEmailVerificationSchema),
+  authController.confirmEmailVerification,
+);
+authRouter.post(
+  '/password/reset',
+  emailRateLimiter,
+  validate(requestPasswordResetSchema),
+  authController.requestPasswordReset,
+);
+authRouter.post(
+  '/password/reset/confirm',
+  standardAuthRateLimiter,
+  validate(confirmPasswordResetSchema),
+  authController.confirmPasswordReset,
 );

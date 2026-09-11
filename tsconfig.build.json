@@ -1,0 +1,15 @@
+{
+  // Used only by `npm run build` (and this project's Dockerfile). Separate
+  // from tsconfig.json because that one's `include` covers tests/ too (for
+  // `lint:types` and ts-jest) — compiling with rootDir "." against that
+  // full include set would place server.ts's output at dist/src/server.js
+  // instead of dist/server.js, breaking package.json's main/start
+  // ("node dist/server.js"). Scoping rootDir/include to src/ here keeps
+  // build output flat under dist/ while leaving tsconfig.json (and the
+  // tests it covers) untouched.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src"
+  },
+  "include": ["src/**/*.ts"]
+}

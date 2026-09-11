@@ -7,11 +7,14 @@ For a full line-by-line explanation of every file, see **[EXPLANATION.md](./EXPL
 
 ## Stack
 
-- Node.js + TypeScript + Express
+- Node.js (>= 20 — see `package.json`'s `engines`; `nodemailer` 10 requires it) + TypeScript + Express
+- `tsx` for the local dev server (`npm run dev`), auto-restarting on file changes
 - PostgreSQL + [Prisma](https://www.prisma.io/) (schema + migrations + typed client)
 - JWT access tokens (`jsonwebtoken`) + opaque, rotated, hashed refresh tokens
 - `bcryptjs` for password hashing
 - `google-auth-library` for the Google OAuth authorization-code flow
+- `nodemailer`, against an [Ethereal](https://ethereal.email) test transport,
+  for email verification / password-reset links
 - `zod` for request validation
 - Jest + Supertest + `jest-mock-extended` for tests
 
@@ -39,6 +42,18 @@ npm run dev                          # http://localhost:4000
 If you set up the database before this `isActive`/lockout addition, run
 `npx prisma migrate dev` again to pick up the new columns.
 
+If you set up the database before the email-verification/password-reset
+addition, run `npx prisma migrate dev` again to create the
+`verification_tokens` table.
+
+Outbound email (verification/reset links) goes through a real SMTP
+connection to [Ethereal](https://ethereal.email) — no local mail server
+needed, but it does need network access. On first send, if
+`ETHEREAL_SMTP_USER`/`ETHEREAL_SMTP_PASS` aren't set, the app mints a
+throwaway Ethereal account and logs it; every send after that also logs a
+preview URL — that link is how you actually read a "sent" email in dev,
+since Ethereal never delivers anywhere real. See `.env.example`.
+
 ## Tests
 
 ```bash
@@ -49,13 +64,40 @@ Unit tests never touch a real database — Prisma is replaced with a deep mock
 (`tests/mocks/prisma.mock.ts`), so they run instantly and deterministically.
 See EXPLANATION.md for how the mocking works and what each test covers.
 
-This has actually been run, not just written: 114 tests passing, `tsc --noEmit`
-clean, and the full HTTP flow (signup/login/refresh rotation/reuse-detection/
-Google redirect/CORS behavior/trust-proxy/body-size-limit/graceful shutdown/
-account lockout/disabled-account handling/Unicode email normalization/
-OAuth-handoff backpressure/malformed-CORS-config rejection) exercised against
-a real Postgres instance — see the session transcript linked in the commits
-if you want the raw output.
+This has actually been run, not just written: 144 tests passing (all 17
+suites), `tsc --noEmit` clean, and the full HTTP flow (including the
+email-verification / password-reset / Google-linking fixes, and the
+follow-up fixes from an automated review of that same PR) exercised
+against a real Postgres instance — signup sending a real email through
+Ethereal, the Google-linking account-takeover block reproduced and then
+lifted via a real password reset, old passwords invalidated and sessions
+revoked on reset, a verification token consumed exactly once through its
+new transactional path, and — the one that actually caught a real bug —
+15-30 truly concurrent wrong-password requests against a fresh account,
+repeated across several fix iterations, until the account reliably ends
+up locked with a plausible attempt count every time instead of
+intermittently unlocked with an under-count. See the session transcript
+linked in the commit if you want the raw output.
+
+## CI
+
+`.github/workflows/ci.yml` runs on every push/PR to `main`: `npm ci`, `npx
+prisma generate`, `npx tsc --noEmit`, then `npm test` — on Node 20.x and
+22.x (18.x is dropped; it went EOL in April 2025). No database service
+container or secrets are needed: `prisma generate` only reads
+`prisma/schema.prisma` (no live connection), and every env var the app
+needs is already seeded by `tests/setup.ts` before the suite runs.
+
+This replaces two earlier workflow files (a "Deno" workflow and a "NodeJS
+with Webpack" one) that were GitHub's generic starter templates, added
+as-is without adapting them to this project — this is a Node/Express/Jest
+app with no Deno code and no webpack config or dependency, so both failed
+on every run for reasons that had nothing to do with the actual code:
+`deno test` can't resolve this project's npm-style imports (`@prisma/client`,
+Jest globals, ...) and exits within a few seconds of trying, and `npx
+webpack` with neither webpack nor a config installed drops into npm's
+"install this for me? (yes/no)" prompt, which has no terminal to answer it
+in CI and fails immediately.
 
 ## API
 
@@ -69,8 +111,20 @@ if you want the raw output.
 | GET    | `/api/auth/google`          | standard   | —              | redirects to Google                   |
 | GET    | `/api/auth/google/callback` | standard   | —              | `?code=&state=` (set by Google)       |
 | POST   | `/api/auth/google/exchange` | standard   | —              | `{ code }` (the handoff code from the callback redirect, not Google's own `code`) |
+| POST   | `/api/auth/email/verify`    | email      | —              | `{ email }` — sends/resends a verification link |
+| POST   | `/api/auth/email/verify/confirm` | standard | —          | `{ token }` |
+| POST   | `/api/auth/password/reset`  | email      | —              | `{ email }` — sends a reset link |
+| POST   | `/api/auth/password/reset/confirm` | standard | —       | `{ token, password }` — also revokes every existing session on the account |
 
-"strict" and "standard" are two **separate** rate-limit budgets (`RATE_LIMIT_STRICT_MAX`/`RATE_LIMIT_STANDARD_MAX`, both per-IP) — signup/login don't share a counter with refresh/logout/exchange/the Google routes, so a burst on one can't lock a client out of another.
+The four email-verification/password-reset endpoints all return a generic
+`{ message }`, not a token pair — see EXPLANATION.md for why `request`-side
+responses are deliberately identical whether or not an account/email
+actually exists (the same enumeration-resistance reasoning as `login`'s
+generic `401`), and why `confirm`-side password reset doesn't hand back
+fresh tokens (every existing session is revoked as part of it; log in again
+with the new password).
+
+"strict", "standard", and "email" are three **separate** rate-limit budgets (each its own instance, all per-IP; "email" reuses `RATE_LIMIT_STRICT_MAX` as its cap but with its own independent counter — see `rateLimit.middleware.ts`) — signup/login don't share a counter with refresh/logout/exchange/the Google routes, and neither shares one with the email-verification/password-reset "request" endpoints, so a burst on one can't lock a client out of another.
 
 `login` also enforces an **account-level lockout**, independent of the per-IP
 limiter above: `LOCKOUT_MAX_ATTEMPTS` (default 5) wrong passwords in a row
@@ -119,12 +173,82 @@ about before shipping this as-is:
   instead, or sticky sessions as a stopgap. Same caveat for rate limiting
   (`express-rate-limit`'s default in-memory store) — per-instance counters,
   not shared across instances, unless you configure a shared store.
-- **No email verification flow** for password signups (`isEmailVerified`
-  stays `false` until/unless a Google account gets linked). Add a
-  verification-email step before trusting `isEmailVerified`.
-- **Refresh token reuse detection** revokes all of a user's other sessions
-  when a used-and-revoked token is replayed, but doesn't yet alert/log that
-  as a security event anywhere — worth wiring into monitoring.
+- **Email verification now exists** (`POST /api/auth/email/verify` +
+  `/confirm`, auto-sent on signup too) — but it uses Ethereal
+  (`src/services/mail.service.ts`), which never delivers anywhere real.
+  Swap in a real transactional-email provider before this is anywhere near
+  production traffic.
+- **Password reset now exists** (`POST /api/auth/password/reset` +
+  `/confirm`) — consuming a reset token also marks the account's email
+  verified (proof of ownership) and revokes every outstanding session. This
+  is also the fix for the Google-linking account-takeover finding below: an
+  account an attacker signed up first, unverified, gets reclaimed by its
+  real owner through this flow.
+- **Google OAuth linking requires the EXISTING account to already be
+  email-verified**, not just Google's own claim about the email
+  (`src/services/google.service.ts`'s `findOrCreateGoogleUser`) — closes a
+  "classic-federated merge" pre-account-hijacking gap: previously, an
+  attacker could sign up first with a victim's email (no verification was
+  ever required for a password account) and the victim's later, genuinely
+  Google-verified sign-in would silently link onto — and leave standing
+  password access on — the attacker's account. An unverified collision now
+  gets a `409` telling the user to verify their email or reset their
+  password first (see the two points above) instead of linking silently.
+- **Refresh token reuse detection now logs a structured `console.error`**
+  (`src/services/token.service.ts`) when a used-and-revoked token is
+  replayed — this project has no logging/alerting pipeline configured, so
+  wiring that log line into real monitoring (it's the single most
+  security-relevant event this service can produce) is the next step.
+- **Account-level lockout counter is now a single atomic `UPDATE`**
+  (`src/services/auth.service.ts`'s `login()`), not a JS-computed value
+  written back — closes a race where several concurrent wrong-password
+  requests could collapse into the counter advancing by only 1 instead of
+  N. Verified against a real, truly-concurrent Postgres run (see that
+  function's comment for the two bugs this closed and how each was
+  reproduced live, including a session-timezone gotcha in a mixed
+  raw-SQL/Prisma comparison that never actually shipped but is worth
+  knowing about).
+- **Google consent denial (`Cancel` on the consent screen) now redirects
+  back to `OAUTH_SUCCESS_REDIRECT_URL?error=google_consent_denied`**
+  instead of dead-ending on a raw `400` — but only for that specific error
+  code; other OAuth provider errors (`server_error`,
+  `temporarily_unavailable`, ...) still get the generic handling, not a
+  misleading "consent denied" label — `src/controllers/auth.controller.ts`.
+- **Consuming a verification/reset token and applying its effect (marking
+  an email verified; setting a new password + revoking sessions) now
+  commit in one transaction** (`src/services/auth.service.ts`,
+  `src/services/verification.service.ts`) — a single-use token failing
+  partway through used to mean it was burned with no effect, or a new
+  password taking hold while old sessions stayed valid.
+- **`nodemailer` is pinned to `^10.0.1`** (up from `^6.9.15`) — the
+  original pin had three known CVEs (a stack-overflow DoS, a
+  disableFileAccess/disableUrlAccess bypass, and a quadratic-time address
+  parser), all fixed by `9.1.0`.
+- **`npm audit` is clean (0 vulnerabilities)** via `package.json`'s
+  `overrides` — `qs` (pulled in below the patched version by `express`
+  itself; there's no 4.x `express` release that resolves a fixed `qs`, only
+  5.x, a breaking major this project isn't taking on for this alone) and
+  `uuid` (pulled in below the patched version by `google-auth-library` →
+  `gaxios`) are both forced to a safe minimum this way instead. `jest` was
+  also bumped to 30.x (with a matching `jest-mock-extended` 4.x and
+  `@types/jest` 30.x) specifically to drop the `rimraf`/`glob`/`inflight`
+  chain the old `ts-node-dev` dev dependency and jest 29's own internals
+  were pulling in; `ts-node-dev` itself was replaced with `tsx` (see
+  `npm run dev`) for the same reason. One deprecation warning remains —
+  `lodash.isequal`, a direct dependency of `jest-mock-extended` itself —
+  and needs an upstream release to clear; there's nothing to override it
+  to.
+- **Access/refresh tokens are returned in the JSON response body, not as
+  `httpOnly` cookies** — a deliberate architectural choice, not an
+  oversight, but one worth stating explicitly rather than leaving implicit:
+  it means whatever frontend consumes this API is responsible for deciding
+  where to hold a long-lived bearer token in a way that isn't readable by
+  arbitrary JS on the page (most reach for `localStorage`, which reopens
+  the door to token theft via XSS — a risk this service is otherwise
+  careful about, see the refresh-rotation/reuse-detection design). If a
+  browser-based frontend consumes this API directly, consider moving at
+  least the refresh token into an `httpOnly` cookie instead of leaving that
+  decision to whichever client integrates first.
 - **Rate limiting is per-IP**, not per-account — a solid baseline, not a
   substitute for per-account lockout/backoff in a production system.
 - **JWT algorithm** is HS256 (shared secret). Fine here; RS256 with a

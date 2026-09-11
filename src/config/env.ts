@@ -160,6 +160,39 @@ const envSchema = z.object({
   // this closes that gap by tracking failed attempts per-account instead.
   LOCKOUT_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
   LOCKOUT_DURATION_MS: z.coerce.number().int().positive().default(15 * 60 * 1000),
+
+  // Email verification (auth.service.ts / mail.service.ts) — a signup no
+  // longer just sets isEmailVerified: false and leaves it that way forever;
+  // it also emails a single-use, time-limited link the same shape as a
+  // refresh token (see VerificationToken in schema.prisma). This is the
+  // frontend page that link points at; the token is appended as ?token=.
+  EMAIL_VERIFICATION_URL: z.string().url().default('http://localhost:3000/verify-email'),
+  EMAIL_VERIFICATION_TOKEN_TTL_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(24 * 60 * 60 * 1000),
+
+  // Password reset — same single-use/time-limited token shape, but a much
+  // shorter TTL: unlike an email-verification link, this one alone is
+  // enough to take over the account (see confirmPasswordReset), so it's
+  // worth less time being replayable/guessable if it leaks (a mail client
+  // pre-fetching links, a shared inbox, a browser history sync).
+  PASSWORD_RESET_URL: z.string().url().default('http://localhost:3000/reset-password'),
+  PASSWORD_RESET_TOKEN_TTL_MS: z.coerce.number().int().positive().default(60 * 60 * 1000),
+
+  // Outbound mail (mail.service.ts) is sent through Ethereal
+  // (https://ethereal.email) — a fake SMTP service that never delivers
+  // anywhere real but captures every message behind a shareable preview
+  // URL, which is what this project actually needs right now (there's no
+  // real transactional-email provider wired up yet — see README). Leave
+  // these unset for a fresh throwaway Ethereal account minted on first send
+  // (logged to the console); set both to pin a specific one instead (e.g.
+  // shared across a team, or reused across restarts) so old preview links
+  // don't go stale.
+  EMAIL_FROM: z.string().min(1).default('"Auth Service" <no-reply@auth-service.local>'),
+  ETHEREAL_SMTP_USER: z.string().optional(),
+  ETHEREAL_SMTP_PASS: z.string().optional(),
 });
 
 // Fails fast on boot (or on first import in tests — see tests/setup.ts, which

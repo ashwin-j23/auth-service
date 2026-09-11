@@ -1,15 +1,83 @@
+# Full local stack for auth-service: Postgres + a one-shot schema-sync job
+# + the API server.
+#
+# Usage:
+#   cp .env.example .env      # fill in JWT/cookie secrets, Google OAuth, etc.
+#   docker compose up --build
+#
+# The API is then reachable at http://localhost:4000 (or $PORT if you set
+# one) — try http://localhost:4000/health.
 services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: auth_service
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-auth_service}
     ports:
-      - '5432:5432'
+      - '${POSTGRES_PORT:-5432}:5432'
     volumes:
       - auth_service_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-auth_service}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    networks:
+      - auth_service_net
+
+  # One-shot job: applies the database schema, then exits. The `app` service
+  # below waits for this to finish successfully before it starts. Uses the
+  # `build` stage (full node_modules incl. the Prisma CLI, which the slim
+  # runtime image intentionally omits). See scripts/docker-migrate.sh for
+  # how it picks between `prisma migrate deploy` and `prisma db push`.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: build
+    command: ['sh', 'scripts/docker-migrate.sh']
+    restart: 'no'
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-auth_service}?schema=public
+    networks:
+      - auth_service_net
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # Copy .env.example to .env and fill in real secrets (JWT, Google OAuth,
+    # etc.) before running. Anything set under `environment:` below overrides
+    # values from this file — used here to force DATABASE_URL onto the
+    # `postgres` service name instead of whatever host .env has for
+    # local/non-Docker use.
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: ${PORT:-4000}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-auth_service}?schema=public
+    ports:
+      - '${PORT:-4000}:${PORT:-4000}'
+    networks:
+      - auth_service_net
+
+networks:
+  auth_service_net:
+    driver: bridge
 
 volumes:
   auth_service_pgdata:
