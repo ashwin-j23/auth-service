@@ -1,12 +1,17 @@
-# Full local stack for auth-service: Postgres + a one-shot schema-sync job
-# + the API server.
+# Full stack for auth-service: Postgres + a one-shot schema-sync job + the
+# API server + an nginx reverse proxy (TLS via Let's Encrypt/certbot).
 #
-# Usage:
+# Local dev (no nginx/TLS needed):
 #   cp .env.example .env      # fill in JWT/cookie secrets, Google OAuth, etc.
-#   docker compose up --build
+#   docker compose up --build postgres migrate app
+#   # -> http://localhost:4000, e.g. http://localhost:4000/health
 #
-# The API is then reachable at http://localhost:4000 (or $PORT if you set
-# one) — try http://localhost:4000/health.
+# Server deploy behind nginx at https://ashwin.opsmonsters.com (DNS already
+# pointed at this box, Cloudflare set to DNS-only for this record):
+#   cp .env.example .env      # fill in real secrets; set TRUST_PROXY=1
+#   ./scripts/init-letsencrypt.sh you@example.com   # one-time TLS bootstrap
+#   docker compose up -d --build
+# See nginx/conf.d/ashwin.opsmonsters.com.conf and README.md for details.
 services:
   postgres:
     image: postgres:16-alpine
@@ -70,10 +75,50 @@ services:
       NODE_ENV: ${NODE_ENV:-production}
       PORT: ${PORT:-4000}
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${POSTGRES_DB:-auth_service}?schema=public
+      # nginx sits in front of the app in this compose file (see below), so
+      # req.ip must trust the one hop it adds — see .env.example. Override
+      # via .env only if you also change the proxy topology.
+      TRUST_PROXY: ${TRUST_PROXY:-1}
+    # Bound to localhost only: nginx (below) is what the outside world talks
+    # to on 80/443. This just keeps the app reachable for local
+    # debugging/health checks (e.g. over an SSH tunnel) without exposing it
+    # directly to the internet a second time alongside nginx.
     ports:
-      - '${PORT:-4000}:${PORT:-4000}'
+      - '127.0.0.1:${PORT:-4000}:${PORT:-4000}'
     networks:
       - auth_service_net
+
+  # Reverse proxy + TLS termination for https://ashwin.opsmonsters.com.
+  # Config lives in nginx/conf.d/. Run scripts/init-letsencrypt.sh once
+  # before the first `docker compose up` on a fresh server — it bootstraps
+  # the certificate that this config's `server { listen 443 ... }` block
+  # expects to already exist.
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - '80:80'
+      - '443:443'
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
+      - ./certbot/www:/var/www/certbot:ro
+    networks:
+      - auth_service_net
+
+  # Renews the Let's Encrypt certificate in the background for as long as
+  # the stack is up. Initial issuance is done by scripts/init-letsencrypt.sh,
+  # not by this service.
+  certbot:
+    image: certbot/certbot:latest
+    restart: unless-stopped
+    volumes:
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    entrypoint: >-
+      sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'
 
 networks:
   auth_service_net:

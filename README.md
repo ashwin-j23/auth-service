@@ -23,8 +23,11 @@ For a full line-by-line explanation of every file, see **[EXPLANATION.md](./EXPL
 ```bash
 npm install
 
-# Start a local Postgres (or point DATABASE_URL at your own instance)
-docker compose up -d
+# Start a local Postgres (or point DATABASE_URL at your own instance).
+# docker-compose.yml also defines `app`/`nginx`/`certbot` for a full server
+# deploy (see "Deploying" below) — not needed for local dev, so scope this
+# to just the database:
+docker compose up -d postgres
 
 cp .env.example .env
 # then fill in .env — at minimum DATABASE_URL, JWT_ACCESS_SECRET, COOKIE_SECRET,
@@ -53,6 +56,58 @@ needed, but it does need network access. On first send, if
 throwaway Ethereal account and logs it; every send after that also logs a
 preview URL — that link is how you actually read a "sent" email in dev,
 since Ethereal never delivers anywhere real. See `.env.example`.
+
+## Deploying (nginx + Let's Encrypt, via docker-compose)
+
+`docker-compose.yml` includes an `nginx` service that terminates TLS for
+**https://ashwin.opsmonsters.com** and reverse-proxies to the `app`
+service, plus a `certbot` service that keeps the certificate renewed.
+Config is in `nginx/conf.d/ashwin.opsmonsters.com.conf`.
+
+Prerequisites:
+
+- A server with Docker + the Compose plugin, ports 80 and 443 open.
+- `ashwin.opsmonsters.com`'s DNS record in Cloudflare already points at
+  this server's IP and is set to **DNS-only (grey cloud)** — Let's
+  Encrypt's HTTP challenge and TLS termination both happen on this box
+  directly, not through Cloudflare's proxy. (If you switch that record to
+  proxied/orange-cloud later, set Cloudflare's SSL/TLS mode to "Full
+  (strict)" so it doesn't break against this setup.)
+
+```bash
+git clone <this repo> && cd auth-service   # on the server
+
+cp .env.example .env
+# Fill in real secrets: JWT_ACCESS_SECRET, COOKIE_SECRET, GOOGLE_*,
+# CORS_ALLOWED_ORIGINS (your real frontend origin, not localhost),
+# OAUTH_SUCCESS_REDIRECT_URL / EMAIL_VERIFICATION_URL / PASSWORD_RESET_URL
+# (your real frontend routes). TRUST_PROXY is already set for you by
+# docker-compose.yml — no need to set it in .env for this path.
+
+# One-time TLS bootstrap (see scripts/init-letsencrypt.sh for what this
+# does) — needs port 80 reachable from the internet already:
+./scripts/init-letsencrypt.sh you@example.com
+
+# Bring up the full stack: postgres, the migrate job, the app, nginx, certbot
+docker compose up -d --build
+```
+
+The site is then live at `https://ashwin.opsmonsters.com` (nginx proxies
+`/` and `/health` to the app on its internal docker network; the app's own
+port is bound to `127.0.0.1` only — see the `app` service's `ports:` — so
+it's not reachable from outside except through nginx).
+
+To pick up code changes later: `git pull && docker compose up -d --build`.
+
+Renewal: the `certbot` service checks twice a day and renews automatically
+when the cert is within 30 days of expiry, but nginx doesn't reload on its
+own to pick up a renewed cert — add a host cron entry like:
+
+```cron
+0 3 * * * cd /path/to/auth-service && docker compose exec nginx nginx -s reload
+```
+
+(harmless to run daily even when nothing renewed).
 
 ## Tests
 
