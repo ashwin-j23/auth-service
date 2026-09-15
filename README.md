@@ -133,10 +133,15 @@ curl http://127.0.0.1:4000/health           # confirm it's up locally
 
 Then, on the host's *existing* nginx (needs whoever has root there — this
 does nothing you can do from inside this repo), add a new server block for
-`ashwin.opsmonsters.com` proxying to `127.0.0.1:4000` (mirroring
-`nginx/conf.d/ashwin.opsmonsters.com.conf`'s `location` blocks), and issue
-its cert the same way the box's other sites already get theirs — most
-commonly `sudo certbot --nginx -d ashwin.opsmonsters.com`.
+`ashwin.opsmonsters.com` proxying to `127.0.0.1:4000`. Use
+`nginx/host-reverse-proxy/ashwin.opsmonsters.com.conf` as the vhost to
+install (e.g. as `/etc/nginx/sites-available/ashwin.opsmonsters.com`) — it
+matches the plain, non-Dockerized style the box's other sites already use,
+not `nginx/conf.d/ashwin.opsmonsters.com.conf`'s Docker-network-specific
+`upstream` block. Issue its cert the same way the box's other sites already
+get theirs — most commonly `sudo certbot --nginx -d ashwin.opsmonsters.com`,
+which will also rewrite that file's `listen 443`/`ssl_certificate` lines
+in place.
 
 ## Tests
 
