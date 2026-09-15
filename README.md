@@ -135,13 +135,18 @@ Then, on the host's *existing* nginx (needs whoever has root there — this
 does nothing you can do from inside this repo), add a new server block for
 `ashwin.opsmonsters.com` proxying to `127.0.0.1:4000`. Use
 `nginx/host-reverse-proxy/ashwin.opsmonsters.com.conf` as the vhost to
-install (e.g. as `/etc/nginx/sites-available/ashwin.opsmonsters.com`) — it
-matches the plain, non-Dockerized style the box's other sites already use,
-not `nginx/conf.d/ashwin.opsmonsters.com.conf`'s Docker-network-specific
-`upstream` block. Issue its cert the same way the box's other sites already
-get theirs — most commonly `sudo certbot --nginx -d ashwin.opsmonsters.com`,
-which will also rewrite that file's `listen 443`/`ssl_certificate` lines
-in place.
+install (e.g. as `/etc/nginx/conf.d/ashwin.opsmonsters.com.conf`, matching
+however this box already lays out its other sites' configs) — it matches
+the plain, non-Dockerized style the box's other sites already use, not
+`nginx/conf.d/ashwin.opsmonsters.com.conf`'s Docker-network-specific
+`upstream` block. That file is deliberately HTTP-only (no `listen 443`
+block yet) — install it as-is, `nginx -t` + reload, *then* issue the cert
+the same way the box's other sites already get theirs, most commonly
+`certbot --nginx -d ashwin.opsmonsters.com`. Certbot's nginx plugin will
+find the port-80 block, complete the HTTP-01 challenge through it, and
+edit the file itself to add the `listen 443 ssl`/`ssl_certificate`/redirect
+lines — don't pre-write those by hand, or `certbot --nginx`'s own
+`nginx -t` preflight will fail against a cert that doesn't exist yet.
 
 ## Tests
 
