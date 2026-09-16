@@ -1,0 +1,21 @@
+$kind: http-request
+name: 'Signup — duplicate email (expect 409)'
+order: 1000
+method: POST
+url: '{{baseUrl}}/signup'
+description: Run "Happy Path > Signup" first so this email already exists in the database.
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "email": "{{email}}",
+      "password": "{{password}}"
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('409 Conflict', () => pm.response.to.have.status(409));

@@ -1,0 +1,8 @@
+$kind: collection
+name: '3. Password Reset'
+description: |-
+  Request and confirm a password reset.
+  Same anti-enumeration shape as email verification — the request endpoint
+  always returns the same message. Grab the token from the mail log/transport
+  in dev and set passwordResetToken before running Confirm Reset.
+order: 3000

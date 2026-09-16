@@ -1,0 +1,22 @@
+$kind: http-request
+order: 5000
+method: POST
+url: '{{baseUrl}}/logout'
+description: |-
+  204 No Content — revokes this one refresh token. Does not require a bearer
+  token (access token). Run "Refresh After Logout (expect 401)" in the
+  Validation folder right after to confirm the token is actually dead.
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "refreshToken": "{{refreshToken}}"
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('204 No Content', () => pm.response.to.have.status(204));

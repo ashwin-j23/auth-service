@@ -1,0 +1,16 @@
+$kind: collection
+name: Auth Service
+description: |-
+  All endpoints under /api/auth — matching src/routes/auth.routes.ts,
+  src/validators/auth.validators.ts, and src/controllers/auth.controller.ts.
+
+  Run requests in order within each folder. The Happy Path folder chains
+  variables (accessToken, refreshToken) via afterResponse scripts so each
+  request feeds the next automatically.
+
+  Google OAuth (folder 4) is a browser-assisted flow — see the individual
+  request descriptions for the step-by-step instructions.
+variables:
+  - key: baseUrl
+    value: 'http://localhost:4000/api/auth'
+    description: Base URL for the Auth Service API

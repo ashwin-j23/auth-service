@@ -1,0 +1,43 @@
+$kind: http-request
+name: Exchange Handoff Code
+order: 3000
+method: POST
+url: '{{baseUrl}}/google/exchange'
+description: |-
+  200 { user, tokens } — trades the short-lived handoff code for the actual
+  access + refresh token pair. The handoff code is single-use and expires
+  after 60 seconds.
+
+  Set googleHandoffCode from the ?code= query param on the frontend redirect
+  URL after completing the browser flow (see "Start Google Login").
+
+  400 if the handoff code is invalid, expired (60s TTL), or already used.
+
+  Why a handoff code instead of tokens in the redirect URL?
+  Tokens in a URL end up in browser history, server access logs, and Referer
+  headers sent to third-party resources. The opaque handoff code is useless
+  on its own — only this POST exchange reveals the real tokens.
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "code": "{{googleHandoffCode}}"
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('200 OK', () => pm.response.to.have.status(200));
+      const body = pm.response.json();
+      pm.test('returns user + tokens', () => {
+        pm.expect(body.user).to.have.property('id');
+        pm.expect(body.tokens).to.have.property('accessToken');
+        pm.expect(body.tokens).to.have.property('refreshToken');
+      });
+      if (body.tokens) {
+        pm.environment.set('accessToken', body.tokens.accessToken);
+        pm.environment.set('refreshToken', body.tokens.refreshToken);
+      }

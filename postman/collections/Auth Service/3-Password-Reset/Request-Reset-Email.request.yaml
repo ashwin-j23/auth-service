@@ -1,0 +1,26 @@
+$kind: http-request
+name: Request Reset Email
+order: 1000
+method: POST
+url: '{{baseUrl}}/password/reset'
+description: |-
+  Always 200 with the same message whether or not the email exists
+  (anti-enumeration). Rate-limited tightly (email tier).
+  Grab the token from the mail log/transport in dev and set passwordResetToken.
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "email": "{{email}}"
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('200 OK, generic message', () => {
+        pm.response.to.have.status(200);
+        pm.expect(pm.response.json().message).to.match(/password reset link has been sent/);
+      });

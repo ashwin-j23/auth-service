@@ -1,0 +1,27 @@
+$kind: http-request
+name: Confirm Verification
+order: 2000
+method: POST
+url: '{{baseUrl}}/email/verify/confirm'
+description: |-
+  Set the environment variable emailVerifyToken to the token from the emailed
+  link's ?token= query param first (grab it from the mail log/transport in dev).
+  200 { message: "Email verified." } on success.
+  400 if the token is invalid, expired, or already used.
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "token": "{{emailVerifyToken}}"
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('200 OK', () => {
+        pm.response.to.have.status(200);
+        pm.expect(pm.response.json().message).to.eql('Email verified.');
+      });

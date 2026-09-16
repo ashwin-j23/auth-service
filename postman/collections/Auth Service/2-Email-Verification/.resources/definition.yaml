@@ -1,0 +1,8 @@
+$kind: collection
+name: '2. Email Verification'
+description: |-
+  Request and confirm email verification.
+  The "request" endpoint is rate-limited tightly (email tier) and always
+  returns the same message whether or not the email exists (anti-enumeration).
+  Grab the token from the mail log/transport in dev and set emailVerifyToken.
+order: 2000

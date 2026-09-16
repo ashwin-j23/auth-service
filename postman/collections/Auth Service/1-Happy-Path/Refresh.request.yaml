@@ -1,0 +1,32 @@
+$kind: http-request
+name: 'Refresh (rotates the token)'
+order: 4000
+method: POST
+url: '{{baseUrl}}/refresh'
+description: |-
+  200 { tokens } with a freshly rotated pair — the refresh token you sent is
+  now burned (single-use). The new pair is saved to environment variables.
+  401 if the token was invalid, expired, or already used. Reuse of a burned
+  token also revokes the entire token chain server-side.
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "refreshToken": "{{refreshToken}}"
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('200 OK', () => pm.response.to.have.status(200));
+      const body = pm.response.json();
+      pm.test('old refresh token is gone, new one issued', () => {
+        pm.expect(body.tokens.refreshToken).to.not.eql(pm.environment.get('refreshToken'));
+      });
+      if (body.tokens) {
+        pm.environment.set('accessToken', body.tokens.accessToken);
+        pm.environment.set('refreshToken', body.tokens.refreshToken);
+      }

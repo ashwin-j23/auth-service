@@ -1,0 +1,11 @@
+$kind: http-request
+name: 'Get Me — no token (expect 401)'
+order: 5000
+method: GET
+url: '{{baseUrl}}/me'
+description: Calling GET /me without an Authorization header should return 401.
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('401 Unauthorized', () => pm.response.to.have.status(401));

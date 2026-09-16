@@ -1,0 +1,33 @@
+$kind: http-request
+order: 3000
+method: POST
+url: '{{baseUrl}}/login'
+description: |-
+  200 { user, tokens } on success.
+  401 'Invalid email or password' for ANY failure — the backend deliberately
+  never reveals whether the email exists (anti-enumeration).
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "email": "{{email}}",
+      "password": "{{password}}"
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('200 OK', () => pm.response.to.have.status(200));
+      const body = pm.response.json();
+      pm.test('returns user + tokens', () => {
+        pm.expect(body.user).to.have.property('id');
+        pm.expect(body.tokens).to.have.property('accessToken');
+        pm.expect(body.tokens).to.have.property('refreshToken');
+      });
+      if (body.tokens) {
+        pm.environment.set('accessToken', body.tokens.accessToken);
+        pm.environment.set('refreshToken', body.tokens.refreshToken);
+      }
