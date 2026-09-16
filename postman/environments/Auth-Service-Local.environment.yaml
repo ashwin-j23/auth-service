@@ -1,0 +1,32 @@
+name: 'Auth Service — Local'
+values:
+  - key: baseUrl
+    value: 'http://localhost:4000/api/auth'
+    description: Base URL for the Auth Service API (matches the Express app mount point)
+  - key: email
+    value: test-user@example.com
+    description: Test user email address used across the Happy Path flow
+  - key: password
+    value: correcthorsebattery
+    description: Test user password (8–72 chars, bcrypt-hashed server-side)
+  - key: newPassword
+    value: correcthorsebattery2
+    description: Replacement password used by the Confirm Reset request
+  - key: name
+    value: Ada Lovelace
+    description: Display name for the test user (optional on signup)
+  - key: accessToken
+    value: ''
+    description: 'Set automatically by Signup, Login, Refresh, and Google Exchange scripts'
+  - key: refreshToken
+    value: ''
+    description: 'Set automatically by Signup, Login, Refresh, and Google Exchange scripts'
+  - key: emailVerifyToken
+    value: ''
+    description: 'Paste the token from the ?token= param in the verification email link'
+  - key: passwordResetToken
+    value: ''
+    description: 'Paste the token from the ?token= param in the password reset email link'
+  - key: googleHandoffCode
+    value: ''
+    description: 'Paste the handoff code from the ?code= param after completing the Google OAuth browser flow'

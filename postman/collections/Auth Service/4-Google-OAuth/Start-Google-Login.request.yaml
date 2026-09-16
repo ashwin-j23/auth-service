@@ -1,0 +1,23 @@
+$kind: http-request
+name: 'Start Google Login (open in browser, not Postman)'
+order: 1000
+method: GET
+url: '{{baseUrl}}/google'
+description: |-
+  This is a real browser redirect flow — Postman's Send button will follow
+  the redirect and show you Google's HTML, which is not useful here.
+
+  Step-by-step:
+    1. Copy {{baseUrl}}/google and open it in an actual browser.
+    2. Sign in and approve the Google consent screen.
+    3. You land on OAUTH_SUCCESS_REDIRECT_URL (the frontend's /oauth/callback)
+       with ?code=<handoff> in the URL.
+    4. Copy that handoff code value into the googleHandoffCode environment variable.
+    5. Run "Exchange Handoff Code" below within 60 seconds — it is single-use
+       and expires after 1 minute.
+
+  What happens server-side:
+    - Generates a cryptographically random state (CSRF token), nonce, and
+      PKCE code_verifier/code_challenge pair.
+    - Stores all three in a single signed HttpOnly cookie (oauth_state).
+    - Redirects the browser to Google's authorization URL with the challenge.

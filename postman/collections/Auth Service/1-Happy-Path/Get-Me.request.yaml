@@ -1,0 +1,23 @@
+$kind: http-request
+name: 'Get Me (authenticated)'
+order: 2000
+method: GET
+url: '{{baseUrl}}/me'
+description: |-
+  200 { user } — returns the currently authenticated user's profile.
+  401 if the bearer token is missing, invalid, or expired.
+  403 if the account has been disabled.
+  404 if the user no longer exists in the database.
+headers:
+  - key: Authorization
+    value: 'Bearer {{accessToken}}'
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('200 OK', () => pm.response.to.have.status(200));
+      const body = pm.response.json();
+      pm.test('returns the signed-up user', () => {
+        pm.expect(body.user.email).to.eql(pm.environment.get('email'));
+        pm.expect(body.user).to.have.property('isEmailVerified');
+      });

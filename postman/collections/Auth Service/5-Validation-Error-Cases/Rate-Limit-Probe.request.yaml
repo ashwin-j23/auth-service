@@ -1,0 +1,29 @@
+$kind: http-request
+name: 'Rate Limit Probe — hammer /login (expect eventual 429)'
+order: 8000
+method: POST
+url: '{{baseUrl}}/login'
+description: |-
+  strictAuthRateLimiter caps /login at RATE_LIMIT_STRICT_MAX (default 30)
+  requests per RATE_LIMIT_WINDOW_MS (default 15 min) per IP.
+
+  Use the Collection Runner to fire this 30+ times back-to-back and confirm
+  it eventually returns 429 with the standard RateLimit-* response headers.
+  Each individual run returns 401 (bad creds) until the limit is hit.
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "email": "rate-limit-probe@example.com",
+      "password": "wrong-on-purpose"
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('status is 401 (bad creds) or 429 (rate limited) — never 500', () => {
+        pm.expect([401, 429]).to.include(pm.response.code);
+      });

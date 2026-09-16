@@ -1,0 +1,27 @@
+$kind: http-request
+name: Request Verification Email
+order: 1000
+method: POST
+url: '{{baseUrl}}/email/verify'
+description: |-
+  Always 200 with the same message whether or not the email exists or is
+  already verified (anti-enumeration). Rate-limited tightly (email tier).
+  In local dev without a real SMTP provider, check the server stdout/log
+  transport for the verification token.
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "email": "{{email}}"
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('200 OK, generic message', () => {
+        pm.response.to.have.status(200);
+        pm.expect(pm.response.json().message).to.match(/verification link has been sent/);
+      });

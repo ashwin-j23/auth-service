@@ -1,0 +1,31 @@
+$kind: http-request
+name: Confirm Reset
+order: 2000
+method: POST
+url: '{{baseUrl}}/password/reset/confirm'
+description: |-
+  200 { message: "Password has been reset. Please log in again." } on success.
+  Revokes EVERY refresh token on the account — no fresh tokens are returned,
+  you must log in again after this.
+  400 on an invalid/expired token or a password failing the 8–72 char rule.
+  After success, the afterResponse script updates {{password}} to {{newPassword}}
+  so the Login request works immediately.
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "token": "{{passwordResetToken}}",
+      "password": "{{newPassword}}"
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('200 OK', () => {
+        pm.response.to.have.status(200);
+        pm.expect(pm.response.json().message).to.eql('Password has been reset. Please log in again.');
+      });
+      pm.environment.set('password', pm.environment.get('newPassword'));

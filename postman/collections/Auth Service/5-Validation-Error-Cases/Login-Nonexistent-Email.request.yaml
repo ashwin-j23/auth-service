@@ -1,0 +1,27 @@
+$kind: http-request
+name: 'Login — nonexistent email (expect same generic 401)'
+order: 4000
+method: POST
+url: '{{baseUrl}}/login'
+description: |-
+  The error message must be identical to the wrong-password case —
+  "Invalid email or password" — confirming the backend does not leak
+  whether an email address has an account.
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "email": "nobody-{{$randomInt}}@example.com",
+      "password": "whatever123"
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('401 Unauthorized, identical message to a wrong password', () => {
+        pm.response.to.have.status(401);
+        pm.expect(pm.response.json().error.message).to.eql('Invalid email or password');
+      });

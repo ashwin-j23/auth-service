@@ -1,0 +1,14 @@
+$kind: http-request
+name: 'Get Me — garbage token (expect 401)'
+order: 6000
+method: GET
+url: '{{baseUrl}}/me'
+description: A malformed/fake bearer token should be rejected with 401.
+headers:
+  - key: Authorization
+    value: 'Bearer not-a-real-token'
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('401 Unauthorized', () => pm.response.to.have.status(401));

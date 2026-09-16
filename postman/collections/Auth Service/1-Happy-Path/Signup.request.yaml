@@ -1,0 +1,35 @@
+$kind: http-request
+order: 1000
+method: POST
+url: '{{baseUrl}}/signup'
+description: |-
+  201 { user, tokens } on success.
+  409 if the email is already registered.
+  400 on validation failure (password must be 8–72 chars, email must be valid).
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "email": "{{email}}",
+      "password": "{{password}}",
+      "name": "{{name}}"
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('201 Created', () => pm.response.to.have.status(201));
+      const body = pm.response.json();
+      pm.test('returns user + tokens', () => {
+        pm.expect(body.user).to.have.property('id');
+        pm.expect(body.user.email).to.eql(pm.environment.get('email'));
+        pm.expect(body.tokens).to.have.property('accessToken');
+        pm.expect(body.tokens).to.have.property('refreshToken');
+      });
+      if (body.tokens) {
+        pm.environment.set('accessToken', body.tokens.accessToken);
+        pm.environment.set('refreshToken', body.tokens.refreshToken);
+      }

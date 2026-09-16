@@ -1,0 +1,19 @@
+$kind: collection
+name: '4. Google OAuth (browser-assisted)'
+description: |-
+  Google OAuth 2.0 flow with PKCE (RFC 7636) + nonce replay protection.
+
+  The flow has three server-side endpoints:
+    GET  /google           — sets a signed cookie (state + nonce + PKCE verifier)
+                             and redirects the browser to Google's consent screen.
+    GET  /google/callback  — Google redirects here with ?code=&state=; the server
+                             validates state/nonce/PKCE, exchanges the code for a
+                             Google ID token, upserts the user, creates a short-lived
+                             handoff code, and redirects the browser to the frontend.
+    POST /google/exchange  — the frontend POSTs the handoff code here to receive
+                             the actual { user, tokens } response.
+
+  Because /google and /google/callback are browser redirect flows, they cannot
+  be tested directly with Postman's Send button. Follow the step-by-step
+  instructions in the "Start Google Login" request description instead.
+order: 4000

@@ -1,0 +1,6 @@
+$kind: collection
+name: '5. Validation & Error Cases'
+description: |-
+  Negative test cases covering validation errors, auth failures, and rate
+  limiting. Run these after the Happy Path folder so the test user exists.
+order: 5000

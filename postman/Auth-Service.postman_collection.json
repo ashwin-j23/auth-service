@@ -1,0 +1,436 @@
+{
+  "info": {
+    "name": "Auth Service (Node/Express/TS/Postgres/Prisma)",
+    "description": "Every endpoint under /api/auth, matching src/routes/auth.routes.ts, src/validators/auth.validators.ts and src/controllers/auth.controller.ts exactly. Import both this collection and Auth-Service.postman_environment.json, select the environment, then run requests top-to-bottom in '1. Happy Path' — each one feeds variables (accessToken, refreshToken, tokens) to the next via its Tests script.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:4000/api/auth" }
+  ],
+  "item": [
+    {
+      "name": "1. Happy Path",
+      "item": [
+        {
+          "name": "Signup",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.test('returns user + tokens', () => {",
+                  "  pm.expect(body.user).to.have.property('id');",
+                  "  pm.expect(body.user.email).to.eql(pm.environment.get('email'));",
+                  "  pm.expect(body.tokens).to.have.property('accessToken');",
+                  "  pm.expect(body.tokens).to.have.property('refreshToken');",
+                  "});",
+                  "if (body.tokens) {",
+                  "  pm.environment.set('accessToken', body.tokens.accessToken);",
+                  "  pm.environment.set('refreshToken', body.tokens.refreshToken);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{email}}\",\n  \"password\": \"{{password}}\",\n  \"name\": \"{{name}}\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/signup", "host": ["{{baseUrl}}"], "path": ["signup"] },
+            "description": "201 { user, tokens } on success. 409 if the email is already registered, 400 on validation (password must be 8-72 chars)."
+          }
+        },
+        {
+          "name": "Get Me (authenticated)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('returns the signed-up user', () => {",
+                  "  pm.expect(body.user.email).to.eql(pm.environment.get('email'));",
+                  "  pm.expect(body.user).to.have.property('isEmailVerified');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }],
+            "url": { "raw": "{{baseUrl}}/me", "host": ["{{baseUrl}}"], "path": ["me"] },
+            "description": "200 { user }. 401 if the bearer token is missing/invalid/expired, 403 if the account has been disabled, 404 if the user no longer exists."
+          }
+        },
+        {
+          "name": "Login",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "if (body.tokens) {",
+                  "  pm.environment.set('accessToken', body.tokens.accessToken);",
+                  "  pm.environment.set('refreshToken', body.tokens.refreshToken);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{email}}\",\n  \"password\": \"{{password}}\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/login", "host": ["{{baseUrl}}"], "path": ["login"] },
+            "description": "200 { user, tokens }. 401 'Invalid email or password' for ANY failure reason — the backend deliberately never reveals whether the email exists."
+          }
+        },
+        {
+          "name": "Refresh (rotates the token)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "pm.test('old refresh token is gone, new one issued', () => {",
+                  "  pm.expect(body.tokens.refreshToken).to.not.eql(pm.environment.get('refreshToken'));",
+                  "});",
+                  "if (body.tokens) {",
+                  "  pm.environment.set('accessToken', body.tokens.accessToken);",
+                  "  pm.environment.set('refreshToken', body.tokens.refreshToken);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refreshToken\": \"{{refreshToken}}\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/refresh", "host": ["{{baseUrl}}"], "path": ["refresh"] },
+            "description": "200 { tokens } with a freshly rotated pair — the refresh token you sent is now burned (single-use). 401 if it was invalid, expired, or already used (reuse of a burned token also revokes the whole chain server-side)."
+          }
+        },
+        {
+          "name": "Logout",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('204 No Content', () => pm.response.to.have.status(204));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"refreshToken\": \"{{refreshToken}}\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/logout", "host": ["{{baseUrl}}"], "path": ["logout"] },
+            "description": "204 empty body — revokes this one refresh token. Does not require a bearer token. Run 'Refresh After Logout (expect 401)' in the Validation folder right after this to confirm it's actually dead."
+          }
+        }
+      ]
+    },
+    {
+      "name": "2. Email Verification",
+      "item": [
+        {
+          "name": "Request Verification Email",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK, generic message', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().message).to.match(/verification link has been sent/);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"{{email}}\"\n}" },
+            "url": { "raw": "{{baseUrl}}/email/verify", "host": ["{{baseUrl}}"], "path": ["email", "verify"] },
+            "description": "Always 200 with the same message whether or not the email exists or is already verified (anti-enumeration). Rate-limited tightly (email tier). The actual link is sent via src/services/mail.service.ts — in local dev without a real SMTP provider configured, check the server's stdout/log transport for the token."
+          }
+        },
+        {
+          "name": "Confirm Verification",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().message).to.eql('Email verified.');",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"token\": \"{{emailVerifyToken}}\"\n}" },
+            "url": { "raw": "{{baseUrl}}/email/verify/confirm", "host": ["{{baseUrl}}"], "path": ["email", "verify", "confirm"] },
+            "description": "Set the environment variable emailVerifyToken to the token from the emailed link's ?token= query param first (grab it from the mail log/transport in dev). 400 if invalid/expired/already used."
+          }
+        }
+      ]
+    },
+    {
+      "name": "3. Password Reset",
+      "item": [
+        {
+          "name": "Request Reset Email",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK, generic message', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().message).to.match(/password reset link has been sent/);",
+                  "});"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"{{email}}\"\n}" },
+            "url": { "raw": "{{baseUrl}}/password/reset", "host": ["{{baseUrl}}"], "path": ["password", "reset"] },
+            "description": "Same anti-enumeration shape as email verification. Grab the token from the mail log/transport in dev and set passwordResetToken."
+          }
+        },
+        {
+          "name": "Confirm Reset",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => {",
+                  "  pm.response.to.have.status(200);",
+                  "  pm.expect(pm.response.json().message).to.eql('Password has been reset. Please log in again.');",
+                  "});",
+                  "pm.environment.set('password', pm.environment.get('newPassword'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"token\": \"{{passwordResetToken}}\",\n  \"password\": \"{{newPassword}}\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/password/reset/confirm", "host": ["{{baseUrl}}"], "path": ["password", "reset", "confirm"] },
+            "description": "Revokes EVERY refresh token on the account (no fresh tokens are returned — log in again after this). 400 on an invalid/expired token or a password failing the 8-72 char rule."
+          }
+        }
+      ]
+    },
+    {
+      "name": "4. Google OAuth (browser-assisted)",
+      "item": [
+        {
+          "name": "Start Google Login (open in browser, not Postman)",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{baseUrl}}/google", "host": ["{{baseUrl}}"], "path": ["google"] },
+            "description": "This is a real browser redirect flow (sets a signed oauth_state cookie, sends you to Google's consent screen) — Postman's 'Send' button will follow the redirect and just show you Google's HTML. Paste this URL into an actual browser instead:\n\n1. Open {{baseUrl}}/google in your browser\n2. Approve consent\n3. You land on OAUTH_SUCCESS_REDIRECT_URL (the frontend's /oauth/callback) with ?code=<handoff>\n4. Copy that handoff code into the googleHandoffCode environment variable\n5. Run 'Exchange Handoff Code' below within 60 seconds (it's single-use and short-lived)"
+          }
+        },
+        {
+          "name": "Exchange Handoff Code",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 OK', () => pm.response.to.have.status(200));",
+                  "const body = pm.response.json();",
+                  "if (body.tokens) {",
+                  "  pm.environment.set('accessToken', body.tokens.accessToken);",
+                  "  pm.environment.set('refreshToken', body.tokens.refreshToken);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"code\": \"{{googleHandoffCode}}\"\n}" },
+            "url": { "raw": "{{baseUrl}}/google/exchange", "host": ["{{baseUrl}}"], "path": ["google", "exchange"] },
+            "description": "200 { user, tokens }. 400 if the handoff code is invalid, expired (60s TTL), or already used."
+          }
+        }
+      ]
+    },
+    {
+      "name": "5. Validation & Error Cases",
+      "item": [
+        {
+          "name": "Signup — duplicate email (expect 409)",
+          "event": [
+            { "listen": "test", "script": { "type": "text/javascript", "exec": [
+              "pm.test('409 Conflict', () => pm.response.to.have.status(409));"
+            ]}}
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"{{email}}\",\n  \"password\": \"{{password}}\"\n}" },
+            "url": { "raw": "{{baseUrl}}/signup", "host": ["{{baseUrl}}"], "path": ["signup"] },
+            "description": "Run 'Happy Path > Signup' first so this email already exists."
+          }
+        },
+        {
+          "name": "Signup — password too short (expect 400)",
+          "event": [
+            { "listen": "test", "script": { "type": "text/javascript", "exec": [
+              "pm.test('400 Bad Request', () => pm.response.to.have.status(400));"
+            ]}}
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"short-pw-{{$randomInt}}@example.com\",\n  \"password\": \"short\"\n}" },
+            "url": { "raw": "{{baseUrl}}/signup", "host": ["{{baseUrl}}"], "path": ["signup"] }
+          }
+        },
+        {
+          "name": "Login — wrong password (expect generic 401)",
+          "event": [
+            { "listen": "test", "script": { "type": "text/javascript", "exec": [
+              "pm.test('401 Unauthorized', () => pm.response.to.have.status(401));",
+              "pm.test('message never reveals which field was wrong', () => {",
+              "  pm.expect(pm.response.json().error.message).to.eql('Invalid email or password');",
+              "});"
+            ]}}
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"{{email}}\",\n  \"password\": \"definitely-wrong\"\n}" },
+            "url": { "raw": "{{baseUrl}}/login", "host": ["{{baseUrl}}"], "path": ["login"] }
+          }
+        },
+        {
+          "name": "Login — nonexistent email (expect same generic 401)",
+          "event": [
+            { "listen": "test", "script": { "type": "text/javascript", "exec": [
+              "pm.test('401 Unauthorized, identical message to a wrong password', () => {",
+              "  pm.response.to.have.status(401);",
+              "  pm.expect(pm.response.json().error.message).to.eql('Invalid email or password');",
+              "});"
+            ]}}
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"nobody-{{$randomInt}}@example.com\",\n  \"password\": \"whatever123\"\n}" },
+            "url": { "raw": "{{baseUrl}}/login", "host": ["{{baseUrl}}"], "path": ["login"] }
+          }
+        },
+        {
+          "name": "Get Me — no token (expect 401)",
+          "event": [
+            { "listen": "test", "script": { "type": "text/javascript", "exec": [
+              "pm.test('401 Unauthorized', () => pm.response.to.have.status(401));"
+            ]}}
+          ],
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{baseUrl}}/me", "host": ["{{baseUrl}}"], "path": ["me"] }
+          }
+        },
+        {
+          "name": "Get Me — garbage token (expect 401)",
+          "event": [
+            { "listen": "test", "script": { "type": "text/javascript", "exec": [
+              "pm.test('401 Unauthorized', () => pm.response.to.have.status(401));"
+            ]}}
+          ],
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Authorization", "value": "Bearer not-a-real-token" }],
+            "url": { "raw": "{{baseUrl}}/me", "host": ["{{baseUrl}}"], "path": ["me"] }
+          }
+        },
+        {
+          "name": "Refresh After Logout (expect 401 — token is burned)",
+          "event": [
+            { "listen": "test", "script": { "type": "text/javascript", "exec": [
+              "pm.test('401 Unauthorized', () => pm.response.to.have.status(401));"
+            ]}}
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"refreshToken\": \"{{refreshToken}}\"\n}" },
+            "url": { "raw": "{{baseUrl}}/refresh", "host": ["{{baseUrl}}"], "path": ["refresh"] },
+            "description": "Run '1. Happy Path > Logout' immediately before this — it revokes {{refreshToken}}, so this call should now fail."
+          }
+        },
+        {
+          "name": "Rate limit probe — hammer /login (expect eventual 429)",
+          "event": [
+            { "listen": "test", "script": { "type": "text/javascript", "exec": [
+              "pm.test('status is 401 (bad creds) or 429 (rate limited) — never 500', () => {",
+              "  pm.expect([401, 429]).to.include(pm.response.code);",
+              "});"
+            ]}}
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"email\": \"rate-limit-probe@example.com\",\n  \"password\": \"wrong-on-purpose\"\n}" },
+            "url": { "raw": "{{baseUrl}}/login", "host": ["{{baseUrl}}"], "path": ["login"] },
+            "description": "strictAuthRateLimiter caps this at RATE_LIMIT_STRICT_MAX (default 30) requests per RATE_LIMIT_WINDOW_MS (default 15min) per IP. Use Postman's Runner to fire this 30+ times back-to-back and confirm it eventually returns 429 with the standard RateLimit-* headers."
+          }
+        }
+      ]
+    }
+  ]
+}

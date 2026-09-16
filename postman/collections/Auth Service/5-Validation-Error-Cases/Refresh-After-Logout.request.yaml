@@ -1,0 +1,23 @@
+$kind: http-request
+name: 'Refresh After Logout (expect 401 — token is burned)'
+order: 7000
+method: POST
+url: '{{baseUrl}}/refresh'
+description: |-
+  Run "1. Happy Path > Logout" immediately before this — it revokes
+  {{refreshToken}}, so this call should now fail with 401.
+  Confirms that logout actually invalidates the token server-side.
+headers:
+  - key: Content-Type
+    value: application/json
+body:
+  type: json
+  content: |-
+    {
+      "refreshToken": "{{refreshToken}}"
+    }
+scripts:
+  - type: afterResponse
+    language: text/javascript
+    code: |-
+      pm.test('401 Unauthorized — token is burned', () => pm.response.to.have.status(401));

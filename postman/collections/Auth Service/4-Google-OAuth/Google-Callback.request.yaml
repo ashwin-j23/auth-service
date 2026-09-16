@@ -1,0 +1,31 @@
+$kind: http-request
+name: 'Google Callback (browser-only — informational)'
+order: 2000
+method: GET
+url: '{{baseUrl}}/google/callback'
+description: |-
+  This endpoint is called automatically by Google after the user approves
+  consent — you never call it directly from Postman.
+
+  What happens server-side:
+    1. Reads the signed oauth_state cookie set by GET /google.
+    2. Validates state (CSRF), nonce, and PKCE code_verifier against the cookie.
+    3. Exchanges the authorization code for a Google ID token (with PKCE verifier).
+    4. Verifies the ID token signature, audience, expiry, and nonce claim.
+    5. Upserts the user in the database (creates on first login, updates on return).
+    6. Issues an access + refresh token pair.
+    7. Stores the result behind a short-lived (60s) single-use handoff code.
+    8. Redirects the browser to OAUTH_SUCCESS_REDIRECT_URL?code=<handoff>.
+
+  If the user clicks "Cancel" on Google's consent screen, Google redirects
+  here with ?error=access_denied and the server redirects the browser back
+  to the frontend with ?cancelled=true instead of returning a JSON error.
+queryParams:
+  - key: code
+    value: ''
+    description: Authorization code from Google (set automatically by the browser redirect)
+    disabled: true
+  - key: state
+    value: ''
+    description: CSRF state token (must match the signed cookie)
+    disabled: true

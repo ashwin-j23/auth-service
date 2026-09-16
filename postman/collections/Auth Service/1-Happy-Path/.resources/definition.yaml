@@ -1,0 +1,4 @@
+$kind: collection
+name: '1. Happy Path'
+description: Core auth flow — run top-to-bottom. Each request captures tokens into environment variables for the next.
+order: 1000
