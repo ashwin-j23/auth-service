@@ -18,7 +18,7 @@ export default function NotFoundPage() {
         <h1 className="text-xl font-bold text-slate-900 dark:text-white">Page not found</h1>
         <p className="text-sm text-slate-500 dark:text-slate-400">The page you&apos;re looking for doesn&apos;t exist.</p>
         <Link to="/dashboard">
-          <Button className="mt-2">Go to dashboard</Button>
+          <Button className="mt-2" data-cursor-target>Go to dashboard</Button>
         </Link>
       </motion.div>
     </AuthLayout>

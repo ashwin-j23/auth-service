@@ -109,7 +109,7 @@ export default function LoginPage() {
           )}
         </div>
 
-        <Button type="submit" fullWidth loading={isSubmitting} disabled={rateLimited}>
+        <Button type="submit" fullWidth loading={isSubmitting} disabled={rateLimited} data-cursor-target>
           {rateLimited ? `Try again in ${countdown}s` : 'Sign in'}
         </Button>
       </form>

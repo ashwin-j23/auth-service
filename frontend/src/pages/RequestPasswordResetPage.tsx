@@ -83,7 +83,7 @@ export default function RequestPasswordResetPage() {
         <FormField label="Email" error={errors.email?.message} required>
           <Input type="email" autoComplete="email" placeholder="you@example.com" {...register('email')} />
         </FormField>
-        <Button type="submit" fullWidth loading={isSubmitting}>
+        <Button type="submit" fullWidth loading={isSubmitting} data-cursor-target>
           Send reset link
         </Button>
       </form>

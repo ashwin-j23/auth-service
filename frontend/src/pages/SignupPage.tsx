@@ -79,7 +79,7 @@ export default function SignupPage() {
         </FormField>
         <PasswordStrengthMeter password={password} />
 
-        <Button type="submit" fullWidth loading={isSubmitting}>
+        <Button type="submit" fullWidth loading={isSubmitting} data-cursor-target>
           Create account
         </Button>
       </form>

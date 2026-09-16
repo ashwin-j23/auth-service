@@ -54,7 +54,7 @@ export default function ResetPasswordPage() {
             This password reset link is missing or malformed. Request a new one to continue.
           </p>
           <Link to="/reset-password/request">
-            <Button className="mt-2">Request a new link</Button>
+            <Button className="mt-2" data-cursor-target>Request a new link</Button>
           </Link>
         </div>
       </AuthLayout>
@@ -101,7 +101,7 @@ export default function ResetPasswordPage() {
           <Input type="password" autoComplete="new-password" placeholder="Re-enter your password" {...register('confirmPassword')} />
         </FormField>
 
-        <Button type="submit" fullWidth loading={isSubmitting}>
+        <Button type="submit" fullWidth loading={isSubmitting} data-cursor-target>
           Reset password
         </Button>
       </form>

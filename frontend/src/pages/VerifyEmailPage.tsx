@@ -86,7 +86,7 @@ export default function VerifyEmailPage() {
             Your email address has been confirmed. You can now sign in.
           </p>
           <Link to="/login">
-            <Button className="mt-2">Continue to sign in</Button>
+            <Button className="mt-2" data-cursor-target>Continue to sign in</Button>
           </Link>
         </motion.div>
       </AuthLayout>

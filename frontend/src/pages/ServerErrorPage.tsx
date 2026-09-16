@@ -21,7 +21,7 @@ export default function ServerErrorPage() {
         <p className="text-sm text-slate-500 dark:text-slate-400">
           We hit an unexpected error on our end. Please try again in a moment.
         </p>
-        <Button className="mt-2" onClick={() => navigate(0)}>
+        <Button className="mt-2" onClick={() => navigate(0)} data-cursor-target>
           <RefreshCw size={15} />
           Try again
         </Button>
