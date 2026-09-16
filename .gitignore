@@ -14,3 +14,10 @@ certbot/
 # Editor/tool-local state, not part of this project
 .kilo/
 .claude/
+
+# Throwaway local Postgres cluster for .devdb/run-backend.sh (dev convenience
+# only — the real deploy path is docker-compose.yml). Ignore everything
+# under .devdb/ (raw Postgres data files, sockets, logs) except the script
+# itself.
+.devdb/*
+!.devdb/run-backend.sh
