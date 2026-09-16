@@ -60,9 +60,11 @@ since Ethereal never delivers anywhere real. See `.env.example`.
 ## Deploying (nginx + Let's Encrypt, via docker-compose)
 
 `docker-compose.yml` includes an `nginx` service that terminates TLS for
-**https://ashwin.opsmonsters.com** and reverse-proxies to the `app`
-service, plus a `certbot` service that keeps the certificate renewed.
-Config is in `nginx/conf.d/ashwin.opsmonsters.com.conf`.
+**https://ashwin.opsmonsters.com**, serves the frontend's static build
+(produced by the one-shot `frontend-build` service), and reverse-proxies
+`/api` + `/health` to the `app` service, plus a `certbot` service that
+keeps the certificate renewed. Config is in
+`nginx/conf.d/ashwin.opsmonsters.com.conf`.
 
 Prerequisites:
 
@@ -97,10 +99,11 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
-The site is then live at `https://ashwin.opsmonsters.com` (nginx proxies
-`/` and `/health` to the app on its internal docker network; the app's own
-port is bound to `127.0.0.1` only — see the `app` service's `ports:` — so
-it's not reachable from outside except through nginx).
+The site is then live at `https://ashwin.opsmonsters.com`: nginx serves the
+frontend at `/` and proxies `/api` + `/health` to the app on its internal
+docker network; the app's own port is bound to `127.0.0.1` only — see the
+`app` service's `ports:` — so it's not reachable from outside except
+through nginx.
 
 To pick up code changes later: `git pull && docker compose up -d --build`.
 
