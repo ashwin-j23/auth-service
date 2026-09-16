@@ -22,13 +22,13 @@ function FloatingBadge({
   className,
   delay = 0,
   duration = 6,
-}: {
+}: Readonly<{
   icon: typeof ShieldCheck;
   label: string;
   className: string;
   delay?: number;
   duration?: number;
-}) {
+}>) {
   return (
     <motion.div
       initial={{ opacity: 0, y: 16 }}
@@ -45,7 +45,7 @@ function FloatingBadge({
   );
 }
 
-export function AuthLayout({ children }: { children: ReactNode }) {
+export function AuthLayout({ children }: Readonly<{ children: ReactNode }>) {
   return (
     <div className="flex min-h-screen bg-slate-50 dark:bg-[rgb(var(--color-bg))]">
       <div className="relative hidden w-1/2 flex-col justify-between overflow-hidden bg-slate-950 p-12 text-white lg:flex">

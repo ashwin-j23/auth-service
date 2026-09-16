@@ -13,6 +13,12 @@ const baseClasses =
   'dark:text-slate-100 placeholder:text-slate-400 dark:placeholder:text-slate-500 transition-colors duration-150 ' +
   'focus:outline-none focus:ring-2 focus:ring-offset-0 disabled:cursor-not-allowed disabled:opacity-60';
 
+function stateClassesFor(error?: boolean, success?: boolean): string {
+  if (error) return 'border-danger-500 focus:ring-danger-500/40';
+  if (success) return 'border-success-500 focus:ring-success-500/40';
+  return 'border-slate-300 dark:border-slate-700 focus:border-brand-500 focus:ring-brand-500/30';
+}
+
 export const Input = forwardRef<HTMLInputElement, InputProps>(
   ({ className, error, success, type, ...props }, ref) => {
     const isPassword = type === 'password';
@@ -20,11 +26,7 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(
     const generatedId = useId();
     const inputId = props.id ?? generatedId;
 
-    const stateClasses = error
-      ? 'border-danger-500 focus:ring-danger-500/40'
-      : success
-        ? 'border-success-500 focus:ring-success-500/40'
-        : 'border-slate-300 dark:border-slate-700 focus:border-brand-500 focus:ring-brand-500/30';
+    const stateClasses = stateClassesFor(error, success);
 
     if (!isPassword) {
       return (

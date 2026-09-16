@@ -21,7 +21,7 @@ export function FormField({
   required,
   children,
   className,
-}: FormFieldProps) {
+}: Readonly<FormFieldProps>) {
   const generatedId = useId();
   const fieldId = htmlFor ?? generatedId;
   const errorId = `${fieldId}-error`;
@@ -44,21 +44,36 @@ export function FormField({
         {required && <span className="ml-0.5 text-danger-500">*</span>}
       </label>
       {child}
-      {error ? (
-        <p id={errorId} role="alert" className="flex items-center gap-1 text-xs font-medium text-danger-500 animate-fade-in">
-          <AlertCircle size={13} className="shrink-0" />
-          {error}
-        </p>
-      ) : helperText ? (
-        <p id={helperId} className="text-xs text-slate-500 dark:text-slate-400">
-          {helperText}
-        </p>
-      ) : null}
+      {renderFieldNote({ error, errorId, helperText, helperId })}
     </div>
   );
 }
 
-export function FieldError({ children }: { children?: ReactNode }) {
+function renderFieldNote({
+  error,
+  errorId,
+  helperText,
+  helperId,
+}: Readonly<{ error?: string; errorId: string; helperText?: string; helperId: string }>) {
+  if (error) {
+    return (
+      <p id={errorId} role="alert" className="flex items-center gap-1 text-xs font-medium text-danger-500 animate-fade-in">
+        <AlertCircle size={13} className="shrink-0" />
+        {error}
+      </p>
+    );
+  }
+  if (helperText) {
+    return (
+      <p id={helperId} className="text-xs text-slate-500 dark:text-slate-400">
+        {helperText}
+      </p>
+    );
+  }
+  return null;
+}
+
+export function FieldError({ children }: Readonly<{ children?: ReactNode }>) {
   if (!children) return null;
   return (
     <p role="alert" className="flex items-center gap-1 text-xs font-medium text-danger-500 animate-fade-in">

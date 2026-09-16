@@ -23,7 +23,7 @@ function GoogleGlyph() {
   );
 }
 
-export function GoogleOAuthButton({ label = 'Continue with Google' }: { label?: string }) {
+export function GoogleOAuthButton({ label = 'Continue with Google' }: Readonly<{ label?: string }>) {
   return (
     <a
       href={api.getGoogleAuthUrl()}

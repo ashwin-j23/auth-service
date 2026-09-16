@@ -15,11 +15,11 @@ export function Badge({
   variant = 'default',
   children,
   className,
-}: {
+}: Readonly<{
   variant?: Variant;
   children: ReactNode;
   className?: string;
-}) {
+}>) {
   return (
     <span
       className={cn(

@@ -10,7 +10,11 @@ export interface DropdownItem {
   icon?: ReactNode;
 }
 
-export function Dropdown({ trigger, items, align = 'end' }: { trigger: ReactNode; items: DropdownItem[]; align?: 'start' | 'end' }) {
+export function Dropdown({
+  trigger,
+  items,
+  align = 'end',
+}: Readonly<{ trigger: ReactNode; items: DropdownItem[]; align?: 'start' | 'end' }>) {
   const [open, setOpen] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -48,7 +52,7 @@ export function Dropdown({ trigger, items, align = 'end' }: { trigger: ReactNode
   }
 
   return (
-    <div ref={rootRef} className="relative" onKeyDown={handleKeyDown}>
+    <div ref={rootRef} className="relative" role="group" onKeyDown={handleKeyDown}>
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}

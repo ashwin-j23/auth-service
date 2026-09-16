@@ -10,14 +10,13 @@ export function Spinner({
   size = 'md',
   className,
   label = 'Loading',
-}: {
+}: Readonly<{
   size?: keyof typeof sizes;
   className?: string;
   label?: string;
-}) {
+}>) {
   return (
-    <span
-      role="status"
+    <output
       aria-label={label}
       className={cn(
         'inline-block animate-spin rounded-full border-current border-t-transparent text-current',

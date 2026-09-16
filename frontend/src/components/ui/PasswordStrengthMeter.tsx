@@ -15,7 +15,7 @@ function scorePassword(password: string): number {
 const labels = ['Too short', 'Weak', 'Fair', 'Good', 'Strong'];
 const colors = ['bg-slate-300 dark:bg-slate-700', 'bg-danger-500', 'bg-warning-500', 'bg-brand-500', 'bg-success-500'];
 
-export function PasswordStrengthMeter({ password }: { password: string }) {
+export function PasswordStrengthMeter({ password }: Readonly<{ password: string }>) {
   const score = scorePassword(password);
   if (!password) return null;
 

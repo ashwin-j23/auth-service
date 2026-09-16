@@ -5,7 +5,7 @@ export function getJwtExpiryMs(token: string): number | null {
   try {
     const [, payload] = token.split('.');
     if (!payload) return null;
-    const normalized = payload.replace(/-/g, '+').replace(/_/g, '/');
+    const normalized = payload.replaceAll('-', '+').replaceAll('_', '/');
     const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), '=');
     const json = JSON.parse(atob(padded)) as { exp?: number };
     return typeof json.exp === 'number' ? json.exp * 1000 : null;

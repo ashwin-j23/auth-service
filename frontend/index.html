@@ -19,7 +19,11 @@
           var prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
           var isDark = stored === 'dark' || (!stored && prefersDark);
           document.documentElement.classList.toggle('dark', isDark);
-        } catch (e) {}
+        } catch (e) {
+          // localStorage can throw (e.g. private browsing with storage
+          // disabled) — falling back to the default light theme is fine,
+          // there's nothing more useful to do this early in page load.
+        }
       })();
     </script>
   </head>

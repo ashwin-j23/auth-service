@@ -22,12 +22,12 @@ export function Avatar({
   email,
   size = 'md',
   className,
-}: {
+}: Readonly<{
   name: string | null;
   email: string;
   size?: Size;
   className?: string;
-}) {
+}>) {
   return (
     <div
       className={cn(

@@ -3,7 +3,7 @@ import { Navigate, useLocation } from 'react-router-dom';
 import { useAuthStore } from '../store/authStore';
 import { AppShell } from '../components/layout/AppShell';
 
-export function ProtectedRoute({ children }: { children: ReactNode }) {
+export function ProtectedRoute({ children }: Readonly<{ children: ReactNode }>) {
   const { status, user } = useAuthStore();
   const location = useLocation();
 
@@ -19,7 +19,7 @@ export function ProtectedRoute({ children }: { children: ReactNode }) {
   return <AppShell>{children}</AppShell>;
 }
 
-export function PublicOnlyRoute({ children }: { children: ReactNode }) {
+export function PublicOnlyRoute({ children }: Readonly<{ children: ReactNode }>) {
   const status = useAuthStore((s) => s.status);
 
   if (status === 'authenticated') {

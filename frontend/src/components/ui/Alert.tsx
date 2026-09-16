@@ -33,13 +33,13 @@ export function Alert({
   children,
   onDismiss,
   className,
-}: {
+}: Readonly<{
   variant?: Variant;
   title?: string;
   children?: ReactNode;
   onDismiss?: () => void;
   className?: string;
-}) {
+}>) {
   const { icon: Icon, classes, iconClasses } = config[variant];
   return (
     <div

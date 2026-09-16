@@ -7,7 +7,7 @@ import { Badge } from '../components/ui/Badge';
 import { Avatar } from '../components/ui/Avatar';
 import { Alert } from '../components/ui/Alert';
 
-function ReadOnlyField({ icon: Icon, label, value }: { icon: typeof User; label: string; value: string }) {
+function ReadOnlyField({ icon: Icon, label, value }: Readonly<{ icon: typeof User; label: string; value: string }>) {
   return (
     <div className="flex items-center gap-3 rounded-input border border-slate-100 bg-slate-50 px-4 py-3 dark:border-slate-800 dark:bg-slate-800/40">
       <Icon size={16} className="shrink-0 text-slate-400" />

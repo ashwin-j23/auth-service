@@ -30,7 +30,7 @@ export function DirectionalCursor({
   targetRef,
   angleOffsetDeg = 20,
   ignoreReducedMotion = false,
-}: DirectionalCursorProps) {
+}: Readonly<DirectionalCursorProps>) {
   const cursorRef = useRef<HTMLDivElement>(null);
   const iconRef = useRef<HTMLDivElement>(null);
   const rafRef = useRef<number | null>(null);

@@ -6,7 +6,7 @@ import { useAuthStore } from '../../store/authStore';
 import { useSilentRefresh } from '../../hooks/useSilentRefresh';
 import { Spinner } from '../ui/Spinner';
 
-export function AuthProvider({ children }: { children: ReactNode }) {
+export function AuthProvider({ children }: Readonly<{ children: ReactNode }>) {
   const status = useAuthStore((s) => s.status);
   const bootstrap = useAuthStore((s) => s.bootstrap);
 

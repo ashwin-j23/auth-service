@@ -2,7 +2,7 @@ import type { ReactNode } from 'react';
 import { motion } from 'framer-motion';
 import { Navbar } from './Navbar';
 
-export function AppShell({ children }: { children: ReactNode }) {
+export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-[rgb(var(--color-bg))]">
       <Navbar />

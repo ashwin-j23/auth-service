@@ -24,10 +24,14 @@ if ! psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -tAc "SELECT 1 FROM pg_da
 fi
 
 echo "[run-backend] applying prisma schema..."
-if [ -z "$(ls -A prisma/migrations 2>/dev/null)" ]; then
-  npx prisma migrate dev --name init --skip-generate
+# ./node_modules/.bin/prisma, not npx prisma: npx can silently fetch and run
+# an arbitrary version of a package on the spot if it's not already
+# installed — the local binary npm already installed is what CI uses too
+# (see ci.yml's own comment on this).
+if [[ -z "$(ls -A prisma/migrations 2>/dev/null)" ]]; then
+  ./node_modules/.bin/prisma migrate dev --name init --skip-generate
 else
-  npx prisma migrate deploy
+  ./node_modules/.bin/prisma migrate deploy
 fi
 
 echo "[run-backend] starting auth-service (tsx watch)..."
