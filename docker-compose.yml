@@ -1,10 +1,14 @@
 # Full stack for auth-service: Postgres + a one-shot schema-sync job + the
-# API server + an nginx reverse proxy (TLS via Let's Encrypt/certbot).
+# API server + a one-shot frontend build + an nginx reverse proxy (TLS via
+# Let's Encrypt/certbot) that serves the built frontend and proxies
+# /api + /health to the API server.
 #
 # Local dev (no nginx/TLS needed):
 #   cp .env.example .env      # fill in JWT/cookie secrets, Google OAuth, etc.
 #   docker compose up --build postgres migrate app
 #   # -> http://localhost:4000, e.g. http://localhost:4000/health
+#   # (the frontend itself is normally run via `npm run dev` in frontend/,
+#   # not through this compose file — see frontend/README.md)
 #
 # Server deploy behind nginx at https://ashwin.opsmonsters.com (DNS already
 # pointed at this box, Cloudflare set to DNS-only for this record):
@@ -94,6 +98,19 @@ services:
     networks:
       - auth_service_net
 
+  # One-shot job: builds the frontend's static production bundle, then
+  # copies it into the frontend_dist volume nginx serves directly (below).
+  # No runtime image of its own — see frontend/Dockerfile.
+  frontend-build:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: build
+    command: ['sh', '-c', 'cp -r dist/. /out/']
+    restart: 'no'
+    volumes:
+      - frontend_dist:/out
+
   # Reverse proxy + TLS termination for https://ashwin.opsmonsters.com.
   # Config lives in nginx/conf.d/. Run scripts/init-letsencrypt.sh once
   # before the first `docker compose up` on a fresh server — it bootstraps
@@ -103,7 +120,10 @@ services:
     image: nginx:1.27-alpine
     restart: unless-stopped
     depends_on:
-      - app
+      app:
+        condition: service_started
+      frontend-build:
+        condition: service_completed_successfully
     ports:
       - '80:80'
       - '443:443'
@@ -111,6 +131,7 @@ services:
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
       - ./certbot/conf:/etc/letsencrypt:ro
       - ./certbot/www:/var/www/certbot:ro
+      - frontend_dist:/usr/share/nginx/html:ro
     networks:
       - auth_service_net
 
@@ -132,3 +153,8 @@ networks:
 
 volumes:
   auth_service_pgdata:
+  # Rebuilt by frontend-build on every `docker compose up --build` — not
+  # meant to persist independently of that, but a named volume (vs. a bind
+  # mount) keeps its ownership/permissions consistent across `nginx`
+  # image versions without relying on anything existing on the host.
+  frontend_dist:
