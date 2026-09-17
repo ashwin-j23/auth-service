@@ -29,7 +29,7 @@ const envSchema = z.object({
     // production when the actual cause is one wrong config value. Parsing
     // the leading number out and checking it's strictly positive catches
     // that at boot instead.
-    .refine((v) => parseFloat(v) > 0, 'JWT_ACCESS_TTL must be greater than zero')
+    .refine((v) => Number.parseFloat(v) > 0, 'JWT_ACCESS_TTL must be greater than zero')
     .default('15m'),
   REFRESH_TOKEN_TTL_DAYS: z.coerce.number().int().positive().default(7),
 

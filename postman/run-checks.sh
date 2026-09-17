@@ -10,6 +10,7 @@ RAND=$((RANDOM * RANDOM))
 EMAIL="postman-check-${RAND}@example.com"
 PASSWORD="correcthorsebattery"
 NEW_PASSWORD="correcthorsebattery2"
+BODY_FILE="/tmp/postman_check_body.json"
 
 green() { printf '\033[32m%s\033[0m\n' "$1"; return 0; }
 red()   { printf '\033[31m%s\033[0m\n' "$1" >&2; return 0; }
@@ -29,7 +30,7 @@ check() {
 req() {
   # req METHOD PATH BODY [BEARER]
   local method="$1" path="$2" body="${3:-}" bearer="${4:-}"
-  local args=(-sS -m 10 -o /tmp/postman_check_body.json -w '%{http_code}' -X "$method" "$BASE$path" -H 'Content-Type: application/json')
+  local args=(-sS -m 10 -o "$BODY_FILE" -w '%{http_code}' -X "$method" "$BASE$path" -H 'Content-Type: application/json')
   [[ -n "$body" ]] && args+=(-d "$body")
   [[ -n "$bearer" ]] && args+=(-H "Authorization: Bearer $bearer")
   curl "${args[@]}" 2>/tmp/postman_check_err.log
@@ -43,7 +44,7 @@ echo
 # --- 1. Happy path ---
 code=$(req POST /signup "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\",\"name\":\"Postman Check\"}")
 check "Signup" 201 "$code"
-BODY=$(cat "/tmp/postman_check_body.json")
+BODY=$(cat "$BODY_FILE")
 ACCESS=$(node -pe "JSON.parse(process.argv[1]).tokens.accessToken" "$BODY" 2>/dev/null)
 REFRESH=$(node -pe "JSON.parse(process.argv[1]).tokens.refreshToken" "$BODY" 2>/dev/null)
 
@@ -52,13 +53,13 @@ check "Get Me (authenticated)" 200 "$code"
 
 code=$(req POST /login "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}")
 check "Login" 200 "$code"
-BODY=$(cat "/tmp/postman_check_body.json")
+BODY=$(cat "$BODY_FILE")
 ACCESS=$(node -pe "JSON.parse(process.argv[1]).tokens.accessToken" "$BODY" 2>/dev/null)
 REFRESH=$(node -pe "JSON.parse(process.argv[1]).tokens.refreshToken" "$BODY" 2>/dev/null)
 
 code=$(req POST /refresh "{\"refreshToken\":\"$REFRESH\"}")
 check "Refresh (rotates token)" 200 "$code"
-BODY=$(cat "/tmp/postman_check_body.json")
+BODY=$(cat "$BODY_FILE")
 OLD_REFRESH="$REFRESH"
 ACCESS=$(node -pe "JSON.parse(process.argv[1]).tokens.accessToken" "$BODY" 2>/dev/null)
 REFRESH=$(node -pe "JSON.parse(process.argv[1]).tokens.refreshToken" "$BODY" 2>/dev/null)
@@ -77,7 +78,7 @@ code=$(req POST /refresh "{\"refreshToken\":\"$REFRESH\"}")
 check "Refresh after logout (token burned)" 401 "$code"
 
 echo
-echo "== Validation & error cases =="
+echo "== Validation & error cases ==" >&2
 
 code=$(req POST /signup "{\"email\":\"$EMAIL\",\"password\":\"$PASSWORD\"}")
 check "Signup duplicate email" 409 "$code"
@@ -87,11 +88,11 @@ check "Signup password too short" 400 "$code"
 
 code=$(req POST /login "{\"email\":\"$EMAIL\",\"password\":\"definitely-wrong\"}")
 check "Login wrong password (generic 401)" 401 "$code"
-MSG1=$(node -pe "JSON.parse(process.argv[1]).error.message" "$(cat "/tmp/postman_check_body.json")" 2>/dev/null)
+MSG1=$(node -pe "JSON.parse(process.argv[1]).error.message" "$(cat "$BODY_FILE")" 2>/dev/null)
 
 code=$(req POST /login "{\"email\":\"nobody-${RAND}@example.com\",\"password\":\"whatever123\"}")
 check "Login nonexistent email (generic 401)" 401 "$code"
-MSG2=$(node -pe "JSON.parse(process.argv[1]).error.message" "$(cat "/tmp/postman_check_body.json")" 2>/dev/null)
+MSG2=$(node -pe "JSON.parse(process.argv[1]).error.message" "$(cat "$BODY_FILE")" 2>/dev/null)
 
 if [[ "$MSG1" == "$MSG2" && -n "$MSG1" ]]; then
   green "PASS  Anti-enumeration: wrong-password and no-such-user return identical messages ('$MSG1')"

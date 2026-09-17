@@ -21,7 +21,7 @@ describe('normalizeEmail', () => {
     const nfd = `jos${eAcuteNFD}@example.com`;
 
     expect(nfc).not.toBe(nfd); // different strings going in...
-    expect(nfc.length).not.toBe(nfd.length); // ...provably different lengths, not just !==
+    expect(nfc).not.toHaveLength(nfd.length); // ...provably different lengths, not just !==
     expect(normalizeEmail(nfc)).toBe(normalizeEmail(nfd)); // ...same one coming out
   });
 
