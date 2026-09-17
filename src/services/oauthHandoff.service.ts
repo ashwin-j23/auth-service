@@ -1,4 +1,4 @@
-import crypto from 'crypto';
+import crypto from 'node:crypto';
 import { env } from '../config/env';
 import { AppError } from '../utils/AppError';
 import type { PublicUser } from '../utils/publicUser';

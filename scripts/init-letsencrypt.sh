@@ -38,7 +38,7 @@ case "$email" in
     ;;
 esac
 
-if [ -d "$data_path/conf/live/$domain" ]; then
+if [[ -d "$data_path/conf/live/$domain" ]]; then
   echo "Existing certificate data found for $domain — skipping issuance."
   echo "Delete $data_path/conf/live/$domain first if you need to start over."
   exit 0
@@ -50,7 +50,7 @@ mkdir -p "$data_path/conf"
 # time — that used to curl these from certbot's repo, which 404s the moment
 # that repo's default branch/path changes upstream. See git history.
 cp "$(dirname "$0")/../nginx/tls/options-ssl-nginx.conf" "$data_path/conf/options-ssl-nginx.conf"
-if [ ! -f "$data_path/conf/ssl-dhparams.pem" ]; then
+if [[ ! -f "$data_path/conf/ssl-dhparams.pem" ]]; then
   echo "### Generating a 2048-bit DH param file (one-time, takes a few seconds-minutes) ..."
   openssl dhparam -out "$data_path/conf/ssl-dhparams.pem" 2048
 fi
@@ -75,7 +75,7 @@ $compose run --rm --entrypoint "\
 
 echo "### Requesting the real Let's Encrypt certificate for $domain ..."
 email_arg="--register-unsafely-without-email"
-if [ -n "$email" ]; then
+if [[ -n "$email" ]]; then
   email_arg="--email $email"
 fi
 $compose run --rm --entrypoint "\

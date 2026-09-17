@@ -117,7 +117,7 @@ export async function login(input: LoginInput): Promise<AuthResult> {
   // enumeration.
   const invalidCredentials = () => new AppError(401, 'Invalid email or password');
 
-  if (!user || !user.passwordHash) {
+  if (!user?.passwordHash) {
     // No account, or a Google-only account — either way there's no password
     // to guess against and no row to track failed attempts on, so lockout
     // doesn't apply; this is the same "nothing to do" case it always was.

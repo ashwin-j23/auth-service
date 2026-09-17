@@ -52,10 +52,11 @@ export function Dropdown({
   }
 
   return (
-    <div ref={rootRef} className="relative" role="group" onKeyDown={handleKeyDown}>
+    <div ref={rootRef} className="relative">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
+        onKeyDown={handleKeyDown}
         aria-haspopup="menu"
         aria-expanded={open}
         className="rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 focus-visible:ring-offset-2"
@@ -66,6 +67,7 @@ export function Dropdown({
         {open && (
           <motion.div
             role="menu"
+            onKeyDown={handleKeyDown}
             initial={{ opacity: 0, scale: 0.96, y: -4 }}
             animate={{ opacity: 1, scale: 1, y: 0 }}
             exit={{ opacity: 0, scale: 0.96, y: -4 }}

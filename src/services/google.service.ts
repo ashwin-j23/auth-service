@@ -1,5 +1,5 @@
 import { OAuth2Client, CodeChallengeMethod } from 'google-auth-library';
-import { Prisma } from '@prisma/client';
+import { Prisma, type User } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { env } from '../config/env';
 import { AppError } from '../utils/AppError';
@@ -113,92 +113,80 @@ export async function exchangeCodeForProfile(
 }
 
 /**
- * Finds the local user matching a Google profile, creating or linking one as
- * needed:
- *  - already linked to this Google account -> return it
- *  - an account with this email exists (e.g. signed up with a password) AND
- *    that account has already independently proven ownership of the email
- *    (isEmailVerified) -> link it, but only then — see the comment below
- *  - otherwise -> create a brand-new, password-less account
- *
- * A single query checks both `googleId` and `email` (rather than two
- * sequential round trips) since at most one of them can realistically match
- * under normal operation — both columns are unique, and a user's googleId is
- * only ever set together with (or onto) the row for their one email.
+ * Links `existing` (an account found by email, not yet linked to this
+ * Google account) onto `profile`'s googleId — see findOrCreateGoogleUser's
+ * doc comment for when this is reached.
  */
-export async function findOrCreateGoogleUser(profile: GoogleProfile) {
-  const existing = await prisma.user.findFirst({
-    where: { OR: [{ googleId: profile.googleId }, { email: profile.email }] },
-  });
-
-  if (existing?.googleId === profile.googleId) {
-    return existing;
+async function linkExistingAccount(existing: User, profile: GoogleProfile) {
+  if (!profile.emailVerified) {
+    throw new AppError(400, 'Google account email is not verified');
   }
-
-  if (existing) {
-    if (!profile.emailVerified) {
-      throw new AppError(400, 'Google account email is not verified');
-    }
-    if (!existing.isEmailVerified) {
-      // The account-takeover fix: `profile.emailVerified` only says GOOGLE
-      // has verified this email — it says nothing about whether THIS
-      // existing row ever did. auth.service.ts's signup() never required
-      // proof of email ownership for a password account, so without this
-      // check an attacker could sign up first with someone else's email
-      // (no verification needed), and the real owner's later, genuinely
-      // Google-verified sign-in would silently link onto — and leave
-      // standing, working password access on — the attacker's account.
-      // This is the "classic-federated merge" pre-account-hijacking
-      // pattern (Paverd et al., USENIX Security 2022).
-      //
-      // Refuse the silent link. The user has to prove they hold the
-      // EXISTING account first — either verifying its email
-      // (POST /auth/email/verify/*) or resetting its password
-      // (POST /auth/password/reset/*, which also marks the email verified
-      // and revokes every outstanding session on the account — see
-      // auth.service.ts's confirmPasswordReset) — after which this exact
-      // Google sign-in links cleanly on the next attempt.
-      throw new AppError(
-        409,
-        'An account with this email already exists but has not verified ownership of it. ' +
-          'Verify your email or reset your password first, then sign in with Google again.',
-      );
-    }
-    try {
-      return await prisma.user.update({
-        where: { id: existing.id },
-        data: { googleId: profile.googleId },
-      });
-    } catch (err) {
-      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-        // `googleId` is @unique, and this update is racing whatever else
-        // might be claiming it concurrently — most plausibly the same
-        // login double-firing (a double-click, two tabs), in which case
-        // some other in-flight request already set this exact googleId on
-        // this exact row, and re-reading it is the correct outcome, not a
-        // failure. But it's also possible (correctly) rejected: this
-        // googleId already belongs to a genuinely DIFFERENT user account —
-        // that's a real conflict, not a race, and must not be silently
-        // papered over by handing back the wrong user.
-        const winner = await prisma.user.findUnique({ where: { googleId: profile.googleId } });
-        if (winner && winner.email === existing.email) {
-          return winner;
-        }
-        throw new AppError(409, 'This Google account is already linked to a different user');
+  if (!existing.isEmailVerified) {
+    // The account-takeover fix: `profile.emailVerified` only says GOOGLE
+    // has verified this email — it says nothing about whether THIS
+    // existing row ever did. auth.service.ts's signup() never required
+    // proof of email ownership for a password account, so without this
+    // check an attacker could sign up first with someone else's email
+    // (no verification needed), and the real owner's later, genuinely
+    // Google-verified sign-in would silently link onto — and leave
+    // standing, working password access on — the attacker's account.
+    // This is the "classic-federated merge" pre-account-hijacking
+    // pattern (Paverd et al., USENIX Security 2022).
+    //
+    // Refuse the silent link. The user has to prove they hold the
+    // EXISTING account first — either verifying its email
+    // (POST /auth/email/verify/*) or resetting its password
+    // (POST /auth/password/reset/*, which also marks the email verified
+    // and revokes every outstanding session on the account — see
+    // auth.service.ts's confirmPasswordReset) — after which this exact
+    // Google sign-in links cleanly on the next attempt.
+    throw new AppError(
+      409,
+      'An account with this email already exists but has not verified ownership of it. ' +
+        'Verify your email or reset your password first, then sign in with Google again.',
+    );
+  }
+  try {
+    return await prisma.user.update({
+      where: { id: existing.id },
+      data: { googleId: profile.googleId },
+    });
+  } catch (err) {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+      // `googleId` is @unique, and this update is racing whatever else
+      // might be claiming it concurrently — most plausibly the same
+      // login double-firing (a double-click, two tabs), in which case
+      // some other in-flight request already set this exact googleId on
+      // this exact row, and re-reading it is the correct outcome, not a
+      // failure. But it's also possible (correctly) rejected: this
+      // googleId already belongs to a genuinely DIFFERENT user account —
+      // that's a real conflict, not a race, and must not be silently
+      // papered over by handing back the wrong user.
+      const winner = await prisma.user.findUnique({ where: { googleId: profile.googleId } });
+      if (winner && winner.email === existing.email) {
+        return winner;
       }
-      throw err;
+      throw new AppError(409, 'This Google account is already linked to a different user');
     }
+    throw err;
   }
+}
 
+/**
+ * Creates a brand-new, password-less account for `profile` — see
+ * findOrCreateGoogleUser's doc comment for when this is reached.
+ */
+async function createNewGoogleUser(profile: GoogleProfile) {
   // Same TOCTOU shape as auth.service.ts's signup() (see EXPLANATION.md §10):
-  // the findFirst above is a fast-path check, not a guard — two Google
-  // logins for the same brand-new account arriving close together (a
-  // double-click on "Continue with Google", or two tabs) can both see "no
-  // existing user" and both reach this create(). Only one INSERT can
-  // actually win against the `email`/`googleId` unique constraints; without
-  // this catch, the loser would throw a raw, unhandled
-  // PrismaClientKnownRequestError straight into errorHandler's generic `500`
-  // branch, on what is, from the user's perspective, a successful login.
+  // findOrCreateGoogleUser's findFirst is a fast-path check, not a guard —
+  // two Google logins for the same brand-new account arriving close
+  // together (a double-click on "Continue with Google", or two tabs) can
+  // both see "no existing user" and both reach this create(). Only one
+  // INSERT can actually win against the `email`/`googleId` unique
+  // constraints; without this catch, the loser would throw a raw,
+  // unhandled PrismaClientKnownRequestError straight into errorHandler's
+  // generic `500` branch, on what is, from the user's perspective, a
+  // successful login.
   try {
     return await prisma.user.create({
       data: {
@@ -224,6 +212,36 @@ export async function findOrCreateGoogleUser(profile: GoogleProfile) {
     }
     throw err;
   }
+}
+
+/**
+ * Finds the local user matching a Google profile, creating or linking one as
+ * needed:
+ *  - already linked to this Google account -> return it
+ *  - an account with this email exists (e.g. signed up with a password) AND
+ *    that account has already independently proven ownership of the email
+ *    (isEmailVerified) -> link it, but only then — see linkExistingAccount
+ *  - otherwise -> create a brand-new, password-less account
+ *
+ * A single query checks both `googleId` and `email` (rather than two
+ * sequential round trips) since at most one of them can realistically match
+ * under normal operation — both columns are unique, and a user's googleId is
+ * only ever set together with (or onto) the row for their one email.
+ */
+export async function findOrCreateGoogleUser(profile: GoogleProfile) {
+  const existing = await prisma.user.findFirst({
+    where: { OR: [{ googleId: profile.googleId }, { email: profile.email }] },
+  });
+
+  if (existing?.googleId === profile.googleId) {
+    return existing;
+  }
+
+  if (existing) {
+    return linkExistingAccount(existing, profile);
+  }
+
+  return createNewGoogleUser(profile);
 }
 
 export interface GoogleLoginResult {
